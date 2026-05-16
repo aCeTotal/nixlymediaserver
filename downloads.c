@@ -1,0 +1,268 @@
+/*
+ * Nixly Media Server - Downloads Module
+ * Per-slot libcurl downloads with progress tracking.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <curl/curl.h>
+
+#include "downloads.h"
+#include "config.h"
+
+static DownloadSlot slots[DOWNLOAD_MAX_SLOTS];
+static pthread_mutex_t slots_lock = PTHREAD_MUTEX_INITIALIZER;
+static int next_id = 1;
+
+static void extract_filename_from_url(const char *url, char *out, size_t out_size) {
+    const char *q = strchr(url, '?');
+    const char *end = q ? q : url + strlen(url);
+    const char *slash = end;
+    while (slash > url && *(slash - 1) != '/') slash--;
+    size_t len = end - slash;
+    if (len == 0 || len >= out_size) {
+        snprintf(out, out_size, "download-%ld", (long)time(NULL));
+        return;
+    }
+    memcpy(out, slash, len);
+    out[len] = '\0';
+
+    /* basic URL-decode for %20 → space */
+    char *r = out, *w = out;
+    while (*r) {
+        if (*r == '%' && r[1] && r[2]) {
+            char hex[3] = { r[1], r[2], 0 };
+            *w++ = (char)strtol(hex, NULL, 16);
+            r += 3;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
+static int progress_cb(void *userdata, curl_off_t dltotal, curl_off_t dlnow,
+                       curl_off_t ultotal, curl_off_t ulnow) {
+    (void)ultotal; (void)ulnow;
+    DownloadSlot *slot = (DownloadSlot *)userdata;
+    pthread_mutex_lock(&slots_lock);
+    slot->total_bytes = (int64_t)dltotal;
+    slot->downloaded_bytes = (int64_t)dlnow;
+    pthread_mutex_unlock(&slots_lock);
+    return 0;
+}
+
+static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *stream) {
+    return fwrite(ptr, size, nmemb, (FILE *)stream);
+}
+
+static void *download_thread(void *arg) {
+    DownloadSlot *slot = (DownloadSlot *)arg;
+
+    pthread_mutex_lock(&slots_lock);
+    slot->state = DL_STATE_ACTIVE;
+    pthread_mutex_unlock(&slots_lock);
+
+    mkdir(slot->type == DL_TYPE_TV
+            ? server_config.tv_download_path
+            : server_config.movie_download_path,
+          0755);
+
+    /* Write to a .nixlypart temp file, then atomic rename when complete.
+     * Watcher skips .nixlypart so scanner only sees the file once it's whole. */
+    char tmp_path[sizeof(slot->dest_path) + 16];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.nixlypart", slot->dest_path);
+
+    FILE *fp = fopen(tmp_path, "wb");
+    if (!fp) {
+        pthread_mutex_lock(&slots_lock);
+        slot->state = DL_STATE_FAILED;
+        snprintf(slot->error, sizeof(slot->error), "cannot open temp file");
+        pthread_mutex_unlock(&slots_lock);
+        return NULL;
+    }
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        fclose(fp);
+        pthread_mutex_lock(&slots_lock);
+        slot->state = DL_STATE_FAILED;
+        snprintf(slot->error, sizeof(slot->error), "curl init failed");
+        pthread_mutex_unlock(&slots_lock);
+        return NULL;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, slot->url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, slot);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "nixly-server/1.0");
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+
+    time_t t0 = time(NULL);
+    CURLcode rc = curl_easy_perform(curl);
+    time_t t1 = time(NULL);
+
+    fclose(fp);
+
+    pthread_mutex_lock(&slots_lock);
+    if (rc == CURLE_OK) {
+        /* Atomic rename — only after this does watcher see the final file. */
+        if (rename(tmp_path, slot->dest_path) != 0) {
+            slot->state = DL_STATE_FAILED;
+            snprintf(slot->error, sizeof(slot->error), "rename failed");
+            remove(tmp_path);
+        } else {
+            slot->state = DL_STATE_DONE;
+            if (slot->total_bytes == 0) slot->total_bytes = slot->downloaded_bytes;
+            int dt = (int)(t1 - t0);
+            slot->speed_bps = dt > 0 ? slot->downloaded_bytes / dt : 0;
+        }
+    } else {
+        slot->state = DL_STATE_FAILED;
+        snprintf(slot->error, sizeof(slot->error), "%s", curl_easy_strerror(rc));
+        remove(tmp_path);
+    }
+    pthread_mutex_unlock(&slots_lock);
+
+    curl_easy_cleanup(curl);
+    return NULL;
+}
+
+int downloads_init(void) {
+    memset(slots, 0, sizeof(slots));
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    return 0;
+}
+
+void downloads_cleanup(void) {
+    curl_global_cleanup();
+}
+
+int downloads_add(const char *url, DownloadType type) {
+    if (!url || !*url) return -1;
+
+    pthread_mutex_lock(&slots_lock);
+    int idx = -1;
+    for (int i = 0; i < DOWNLOAD_MAX_SLOTS; i++) {
+        if (slots[i].state == DL_STATE_IDLE ||
+            slots[i].state == DL_STATE_DONE ||
+            slots[i].state == DL_STATE_FAILED) {
+            if (slots[i].thread_started) {
+                pthread_join(slots[i].thread, NULL);
+                slots[i].thread_started = 0;
+            }
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        pthread_mutex_unlock(&slots_lock);
+        return -1;
+    }
+
+    DownloadSlot *slot = &slots[idx];
+    memset(slot, 0, sizeof(*slot));
+    slot->id = next_id++;
+    slot->type = type;
+    slot->state = DL_STATE_QUEUED;
+    strncpy(slot->url, url, sizeof(slot->url) - 1);
+    extract_filename_from_url(url, slot->filename, sizeof(slot->filename));
+
+    const char *base = (type == DL_TYPE_TV)
+        ? server_config.tv_download_path
+        : server_config.movie_download_path;
+    snprintf(slot->dest_path, sizeof(slot->dest_path), "%s/%s", base, slot->filename);
+
+    if (pthread_create(&slot->thread, NULL, download_thread, slot) != 0) {
+        slot->state = DL_STATE_FAILED;
+        snprintf(slot->error, sizeof(slot->error), "thread create failed");
+        pthread_mutex_unlock(&slots_lock);
+        return -1;
+    }
+    slot->thread_started = 1;
+    pthread_detach(slot->thread);
+
+    int id = slot->id;
+    pthread_mutex_unlock(&slots_lock);
+    return id;
+}
+
+static void json_escape(const char *src, char *dst, size_t dst_size) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 2 < dst_size; i++) {
+        if (src[i] == '"' || src[i] == '\\') {
+            if (j + 3 >= dst_size) break;
+            dst[j++] = '\\';
+            dst[j++] = src[i];
+        } else if ((unsigned char)src[i] < 0x20) {
+            continue;
+        } else {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = '\0';
+}
+
+char *downloads_status_json(void) {
+    size_t cap = 16384;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t used = 0;
+
+    used += snprintf(buf + used, cap - used, "{\"slots\":[");
+
+    pthread_mutex_lock(&slots_lock);
+    int first = 1;
+    for (int i = 0; i < DOWNLOAD_MAX_SLOTS; i++) {
+        DownloadSlot *s = &slots[i];
+        if (s->state == DL_STATE_IDLE) continue;
+
+        if (used + 1024 >= cap) {
+            cap *= 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) break;
+            buf = nb;
+        }
+
+        char fn_esc[1024], err_esc[512];
+        json_escape(s->filename, fn_esc, sizeof(fn_esc));
+        json_escape(s->error, err_esc, sizeof(err_esc));
+
+        float pct = 0.0f;
+        if (s->total_bytes > 0)
+            pct = 100.0f * (float)s->downloaded_bytes / (float)s->total_bytes;
+
+        const char *st = "queued";
+        if (s->state == DL_STATE_ACTIVE) st = "active";
+        else if (s->state == DL_STATE_DONE) st = "done";
+        else if (s->state == DL_STATE_FAILED) st = "failed";
+
+        if (!first) buf[used++] = ',';
+        first = 0;
+
+        used += snprintf(buf + used, cap - used,
+            "{\"id\":%d,\"type\":\"%s\",\"state\":\"%s\","
+            "\"filename\":\"%s\",\"total\":%lld,\"downloaded\":%lld,"
+            "\"percent\":%.1f,\"speed_bps\":%lld,\"error\":\"%s\"}",
+            s->id,
+            s->type == DL_TYPE_TV ? "tv" : "movie",
+            st, fn_esc,
+            (long long)s->total_bytes,
+            (long long)s->downloaded_bytes,
+            pct,
+            (long long)s->speed_bps,
+            err_esc);
+    }
+    pthread_mutex_unlock(&slots_lock);
+
+    used += snprintf(buf + used, cap - used, "]}");
+    return buf;
+}

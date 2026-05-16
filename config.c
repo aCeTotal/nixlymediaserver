@@ -1,0 +1,225 @@
+/*
+ * Nixly Media Server - Configuration Implementation
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <unistd.h>
+#include <time.h>
+#include "config.h"
+
+/* Generate a unique server ID based on hostname and random component */
+static void generate_server_id(char *buf, size_t len) {
+    char hostname[64] = "nixly";
+    gethostname(hostname, sizeof(hostname) - 1);
+    hostname[sizeof(hostname) - 1] = '\0';
+
+    srand(time(NULL) ^ getpid());
+    unsigned int r = rand();
+
+    snprintf(buf, len, "%s-%08x", hostname, r);
+}
+
+ServerConfig server_config;
+
+static char *trim(char *str) {
+    while (isspace(*str)) str++;
+    if (*str == '\0') return str;
+    char *end = str + strlen(str) - 1;
+    while (end > str && isspace(*end)) *end-- = '\0';
+    return str;
+}
+
+static char *expand_path(const char *path, char *out, size_t out_size) {
+    if (path[0] == '~') {
+        const char *home = getenv("HOME");
+        if (!home) {
+            struct passwd *pw = getpwuid(getuid());
+            home = pw ? pw->pw_dir : "/tmp";
+        }
+        snprintf(out, out_size, "%s%s", home, path + 1);
+    } else {
+        strncpy(out, path, out_size - 1);
+        out[out_size - 1] = '\0';
+    }
+    return out;
+}
+
+void config_init_defaults(void) {
+    memset(&server_config, 0, sizeof(server_config));
+
+    server_config.port = 8080;
+    strcpy(server_config.db_path, "~/.local/share/nixly-server/nixly.db");
+
+    /* Default: 500 Mbps upload = ~7 simultaneous 70 Mbps streams */
+    server_config.upload_mbps = 500;
+
+    /* Server identity - generate unique ID, use hostname as name */
+    generate_server_id(server_config.server_id, sizeof(server_config.server_id));
+    gethostname(server_config.server_name, sizeof(server_config.server_name) - 1);
+    server_config.server_name[sizeof(server_config.server_name) - 1] = '\0';
+
+    /* TMDB API key - hardcoded */
+    strcpy(server_config.tmdb_api_key, "d415e076cfcbbe11dd7366a6e2f63321");
+    strcpy(server_config.tmdb_language, "en-US");
+    strcpy(server_config.cache_dir, "~/.cache/nixly-server");
+
+    strcpy(server_config.tv_download_path, "/mnt/bigdisk1/www/aceclan/media/TV");
+    strcpy(server_config.movie_download_path, "/mnt/bigdisk1/www/aceclan/media/Movies");
+
+    strcpy(server_config.auth_user, "nixly");
+    strcpy(server_config.auth_password, "nixlyadmin");
+
+    server_config.media_path_count = 0;
+}
+
+int config_load(const char *path) {
+    char expanded[MAX_PATH_LEN];
+    expand_path(path, expanded, sizeof(expanded));
+
+    FILE *f = fopen(expanded, "r");
+    if (!f) {
+        fprintf(stderr, "Config file not found: %s, using defaults\n", expanded);
+        config_init_defaults();
+        return -1;
+    }
+
+    config_init_defaults();
+
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        char *l = trim(line);
+
+        if (*l == '#' || *l == '\0') continue;
+
+        char *eq = strchr(l, '=');
+        if (!eq) continue;
+
+        *eq = '\0';
+        char *key = trim(l);
+        char *value = trim(eq + 1);
+
+        size_t vlen = strlen(value);
+        if (vlen >= 2 && value[0] == '"' && value[vlen - 1] == '"') {
+            value[vlen - 1] = '\0';
+            value++;
+        }
+
+        if (strcmp(key, "port") == 0) {
+            server_config.port = atoi(value);
+        }
+        else if (strcmp(key, "upload_mbps") == 0) {
+            server_config.upload_mbps = atoi(value);
+        }
+        else if (strcmp(key, "server_id") == 0) {
+            strncpy(server_config.server_id, value, sizeof(server_config.server_id) - 1);
+        }
+        else if (strcmp(key, "server_name") == 0) {
+            strncpy(server_config.server_name, value, sizeof(server_config.server_name) - 1);
+        }
+        else if (strcmp(key, "db_path") == 0) {
+            expand_path(value, server_config.db_path, sizeof(server_config.db_path));
+        }
+        else if (strcmp(key, "tmdb_api_key") == 0) {
+            strncpy(server_config.tmdb_api_key, value, sizeof(server_config.tmdb_api_key) - 1);
+        }
+        else if (strcmp(key, "tmdb_language") == 0) {
+            strncpy(server_config.tmdb_language, value, sizeof(server_config.tmdb_language) - 1);
+        }
+        else if (strcmp(key, "cache_dir") == 0) {
+            expand_path(value, server_config.cache_dir, sizeof(server_config.cache_dir));
+        }
+        else if (strcmp(key, "tv_download_path") == 0) {
+            expand_path(value, server_config.tv_download_path, sizeof(server_config.tv_download_path));
+        }
+        else if (strcmp(key, "movie_download_path") == 0) {
+            expand_path(value, server_config.movie_download_path, sizeof(server_config.movie_download_path));
+        }
+        else if (strcmp(key, "auth_user") == 0) {
+            strncpy(server_config.auth_user, value, sizeof(server_config.auth_user) - 1);
+        }
+        else if (strcmp(key, "auth_password") == 0) {
+            strncpy(server_config.auth_password, value, sizeof(server_config.auth_password) - 1);
+        }
+        else if (strcmp(key, "media_path") == 0) {
+            if (server_config.media_path_count < MAX_WATCH_PATHS) {
+                expand_path(value, server_config.media_paths[server_config.media_path_count],
+                           MAX_PATH_LEN);
+                server_config.media_path_count++;
+            }
+        }
+    }
+
+    fclose(f);
+    printf("Config loaded from %s\n", expanded);
+    return 0;
+}
+
+int config_save(const char *path) {
+    char expanded[MAX_PATH_LEN];
+    expand_path(path, expanded, sizeof(expanded));
+
+    FILE *f = fopen(expanded, "w");
+    if (!f) return -1;
+
+    fprintf(f, "# Nixly Media Server Configuration\n\n");
+
+    fprintf(f, "port = %d\n", server_config.port);
+    fprintf(f, "db_path = %s\n", server_config.db_path);
+    fprintf(f, "upload_mbps = %d\n", server_config.upload_mbps);
+    fprintf(f, "server_id = %s\n", server_config.server_id);
+    fprintf(f, "server_name = %s\n", server_config.server_name);
+    fprintf(f, "tmdb_api_key = %s\n", server_config.tmdb_api_key);
+    fprintf(f, "tmdb_language = %s\n", server_config.tmdb_language);
+    fprintf(f, "cache_dir = %s\n", server_config.cache_dir);
+    fprintf(f, "tv_download_path = %s\n", server_config.tv_download_path);
+    fprintf(f, "movie_download_path = %s\n", server_config.movie_download_path);
+
+    fprintf(f, "\n# Media library paths to watch and scrape\n");
+    for (int i = 0; i < server_config.media_path_count; i++) {
+        fprintf(f, "media_path = %s\n", server_config.media_paths[i]);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/* Calculate server rating based on upload speed
+ * 1000 Mbps or more = 10, 900 = 9, 800 = 8, ... 100 = 1
+ * Used by clients to prefer servers with better bandwidth */
+int config_get_server_rating(void) {
+    int rating = server_config.upload_mbps / 100;
+    if (rating < 1) rating = 1;
+    if (rating > 10) rating = 10;
+    return rating;
+}
+
+/* Thread-local client locality flag */
+static __thread int current_client_local = 0;
+static __thread uint32_t current_client_ip = 0;
+
+void config_set_client_local(int is_local) {
+    current_client_local = is_local;
+}
+
+int config_get_client_local(void) {
+    return current_client_local;
+}
+
+void config_set_client_ip(uint32_t ip) {
+    current_client_ip = ip;
+}
+
+uint32_t config_get_client_ip(void) {
+    return current_client_ip;
+}
+
+/* Get priority: local servers are always preferred (1000+) over remote */
+int config_get_server_priority(void) {
+    int rating = config_get_server_rating();
+    return current_client_local ? (1000 + rating) : rating;
+}
