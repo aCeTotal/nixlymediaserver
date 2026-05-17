@@ -11,5 +11,7 @@ extern const char *page_status_html;
 extern const char *page_wget_html;
 extern const char *page_errors_html;
 extern const char *page_pending_html;
+extern const char *page_rescrape_html;
+extern const char *page_collections_html;
 
 #endif /* PAGES_H */

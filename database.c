@@ -168,6 +168,59 @@ int database_init(const char *db_path) {
         sqlite3_exec(db, "PRAGMA user_version = 1", NULL, NULL, NULL);
     }
 
+    /* v2: cast/credits table keyed by tmdb_id (movie tmdb_id or show tmdb_show_id) */
+    sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS media_cast ("
+        "  tmdb_id INTEGER NOT NULL,"
+        "  ord INTEGER NOT NULL,"
+        "  tmdb_person_id INTEGER,"
+        "  name TEXT,"
+        "  character TEXT,"
+        "  profile_path TEXT,"
+        "  PRIMARY KEY (tmdb_id, ord)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_cast_tmdb ON media_cast(tmdb_id);",
+        NULL, NULL, NULL);
+    if (user_version < 2) {
+        sqlite3_exec(db, "PRAGMA user_version = 2", NULL, NULL, NULL);
+    }
+
+    /* v3: manual collections. */
+    sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS collections ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  name TEXT NOT NULL,"
+        "  created_at INTEGER DEFAULT (strftime('%s','now'))"
+        ");"
+        "CREATE TABLE IF NOT EXISTS collection_items ("
+        "  collection_id INTEGER NOT NULL,"
+        "  media_id INTEGER NOT NULL,"
+        "  ord INTEGER NOT NULL DEFAULT 0,"
+        "  PRIMARY KEY (collection_id, media_id)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_collitems_coll ON collection_items(collection_id);"
+        "CREATE INDEX IF NOT EXISTS idx_collitems_media ON collection_items(media_id);",
+        NULL, NULL, NULL);
+    if (user_version < 3) {
+        sqlite3_exec(db, "PRAGMA user_version = 3", NULL, NULL, NULL);
+    }
+
+    /* v4: per-file tech properties (HDR, audio layout, atmos). */
+    const char *tech_alters[] = {
+        "ALTER TABLE media ADD COLUMN hdr_format TEXT",
+        "ALTER TABLE media ADD COLUMN bit_depth INTEGER",
+        "ALTER TABLE media ADD COLUMN audio_channels INTEGER",
+        "ALTER TABLE media ADD COLUMN audio_layout TEXT",
+        "ALTER TABLE media ADD COLUMN audio_features TEXT",
+        NULL
+    };
+    for (int i = 0; tech_alters[i]; i++) {
+        sqlite3_exec(db, tech_alters[i], NULL, NULL, NULL);
+    }
+    if (user_version < 4) {
+        sqlite3_exec(db, "PRAGMA user_version = 4", NULL, NULL, NULL);
+    }
+
     return 0;
 }
 
@@ -223,8 +276,9 @@ int database_add_media(MediaEntry *entry) {
     const char *sql =
         "INSERT OR REPLACE INTO media "
         "(type, title, filepath, show_name, season, episode, size, duration, "
-        "width, height, codec_video, codec_audio, bitrate) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        "width, height, codec_video, codec_audio, bitrate, "
+        "hdr_format, bit_depth, audio_channels, audio_layout, audio_features) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     sqlite3_stmt *stmt;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -246,6 +300,11 @@ int database_add_media(MediaEntry *entry) {
     sqlite3_bind_text(stmt, 11, entry->codec_video, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 12, entry->codec_audio, -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt, 13, entry->bitrate);
+    sqlite3_bind_text(stmt, 14, entry->hdr_format, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 15, entry->bit_depth);
+    sqlite3_bind_int(stmt, 16, entry->audio_channels);
+    sqlite3_bind_text(stmt, 17, entry->audio_layout, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 18, entry->audio_features, -1, SQLITE_STATIC);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -823,7 +882,8 @@ char *database_get_media_json(int id) {
         "SELECT id, type, title, filepath, show_name, season, episode, size, "
         "duration, width, height, codec_video, codec_audio, bitrate, added_date, "
         "tmdb_id, tmdb_title, overview, poster_path, backdrop_path, release_date, "
-        "year, rating, vote_count, genres, episode_title, episode_overview, still_path "
+        "year, rating, vote_count, genres, episode_title, episode_overview, still_path, "
+        "hdr_format, bit_depth, audio_channels, audio_layout, audio_features "
         "FROM media WHERE id = ?";
 
     sqlite3_stmt *stmt;
@@ -850,6 +910,11 @@ char *database_get_media_json(int id) {
         const char *ep_title = (const char *)sqlite3_column_text(stmt, 25);
         const char *ep_overview = (const char *)sqlite3_column_text(stmt, 26);
         const char *still = (const char *)sqlite3_column_text(stmt, 27);
+        const char *hdr = (const char *)sqlite3_column_text(stmt, 28);
+        int bit_depth = sqlite3_column_int(stmt, 29);
+        int audio_ch = sqlite3_column_int(stmt, 30);
+        const char *audio_layout = (const char *)sqlite3_column_text(stmt, 31);
+        const char *audio_feat = (const char *)sqlite3_column_text(stmt, 32);
 
         char *title_esc = json_escape(title);
         char *path_esc = json_escape(filepath);
@@ -866,6 +931,9 @@ char *database_get_media_json(int id) {
         char *ept_esc = json_escape(ep_title);
         char *epo_esc = json_escape(ep_overview);
         char *still_esc = json_escape(still);
+        char *hdr_esc = json_escape(hdr && hdr[0] ? hdr : NULL);
+        char *alay_esc = json_escape(audio_layout && audio_layout[0] ? audio_layout : NULL);
+        char *afeat_esc = json_escape(audio_feat && audio_feat[0] ? audio_feat : NULL);
 
         json = malloc(16384);
         snprintf(json, 16384,
@@ -878,6 +946,8 @@ char *database_get_media_json(int id) {
             "\"poster\":%s,\"backdrop\":%s,\"release_date\":%s,"
             "\"year\":%d,\"rating\":%.1f,\"vote_count\":%d,\"genres\":%s,"
             "\"episode_title\":%s,\"episode_overview\":%s,\"still\":%s,"
+            "\"hdr_format\":%s,\"bit_depth\":%d,\"audio_channels\":%d,"
+            "\"audio_layout\":%s,\"audio_features\":%s,"
             "\"server_id\":\"%s\",\"server_rating\":%d,\"server_priority\":%d}",
             sqlite3_column_int(stmt, 0),
             sqlite3_column_int(stmt, 1),
@@ -898,6 +968,7 @@ char *database_get_media_json(int id) {
             sqlite3_column_double(stmt, 22),
             sqlite3_column_int(stmt, 23),
             genres_esc, ept_esc, epo_esc, still_esc,
+            hdr_esc, bit_depth, audio_ch, alay_esc, afeat_esc,
             server_config.server_id, config_get_server_rating(),
             config_get_server_priority());
 
@@ -906,9 +977,27 @@ char *database_get_media_json(int id) {
         free(tmdb_esc); free(ov_esc); free(poster_esc);
         free(back_esc); free(rel_esc); free(genres_esc);
         free(ept_esc); free(epo_esc); free(still_esc);
+        free(hdr_esc); free(alay_esc); free(afeat_esc);
     }
 
     sqlite3_finalize(stmt);
+
+    /* Embed cast array if available. */
+    if (json) {
+        char *cast = database_get_cast_json(id);
+        if (cast) {
+            size_t cur_len = strlen(json);
+            if (cur_len > 0 && json[cur_len - 1] == '}') {
+                size_t extra = strlen(cast) + 16;
+                char *combined = malloc(cur_len + extra);
+                memcpy(combined, json, cur_len - 1);
+                snprintf(combined + cur_len - 1, extra, ",\"cast\":%s}", cast);
+                free(json);
+                json = combined;
+            }
+            free(cast);
+        }
+    }
     return json;
 }
 
@@ -993,6 +1082,9 @@ void database_free_entry(MediaEntry *entry) {
         free(entry->still_path);
         free(entry->tmdb_status);
         free(entry->tmdb_next_episode);
+        free(entry->hdr_format);
+        free(entry->audio_layout);
+        free(entry->audio_features);
     }
 }
 
@@ -1162,5 +1254,326 @@ char *database_get_show_episodes_json(const char *show_name, int season) {
     json[buf_used] = '\0';
 
     sqlite3_finalize(stmt);
+    return json;
+}
+
+int database_replace_cast(int tmdb_id, CastEntry *entries, int count) {
+    if (tmdb_id <= 0) return -1;
+
+    sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+
+    sqlite3_stmt *del;
+    if (sqlite3_prepare_v2(db, "DELETE FROM media_cast WHERE tmdb_id=?", -1, &del, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(del, 1, tmdb_id);
+        sqlite3_step(del);
+        sqlite3_finalize(del);
+    }
+
+    const char *ins_sql =
+        "INSERT INTO media_cast (tmdb_id, ord, tmdb_person_id, name, character, profile_path) "
+        "VALUES (?, ?, ?, ?, ?, ?)";
+    sqlite3_stmt *ins;
+    if (sqlite3_prepare_v2(db, ins_sql, -1, &ins, NULL) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -1;
+    }
+    for (int i = 0; i < count; i++) {
+        sqlite3_bind_int(ins, 1, tmdb_id);
+        sqlite3_bind_int(ins, 2, i);
+        sqlite3_bind_int(ins, 3, entries[i].tmdb_person_id);
+        sqlite3_bind_text(ins, 4, entries[i].name ? entries[i].name : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins, 5, entries[i].character ? entries[i].character : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins, 6, entries[i].profile_path ? entries[i].profile_path : "", -1, SQLITE_TRANSIENT);
+        sqlite3_step(ins);
+        sqlite3_reset(ins);
+    }
+    sqlite3_finalize(ins);
+
+    sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    return 0;
+}
+
+char *database_get_cast_json(int media_id) {
+    sqlite3_stmt *st;
+    int tmdb_id = 0;
+    int type = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT type, tmdb_id, tmdb_show_id FROM media WHERE id=?",
+            -1, &st, NULL) != SQLITE_OK) {
+        return strdup("[]");
+    }
+    sqlite3_bind_int(st, 1, media_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        type = sqlite3_column_int(st, 0);
+        int t_id = sqlite3_column_int(st, 1);
+        int show_id = sqlite3_column_int(st, 2);
+        tmdb_id = (type == 2 || type == 1) && show_id > 0 ? show_id : t_id;
+    }
+    sqlite3_finalize(st);
+
+    if (tmdb_id <= 0) return strdup("[]");
+
+    sqlite3_stmt *q;
+    if (sqlite3_prepare_v2(db,
+            "SELECT tmdb_person_id, name, character, profile_path FROM media_cast "
+            "WHERE tmdb_id=? ORDER BY ord",
+            -1, &q, NULL) != SQLITE_OK) {
+        return strdup("[]");
+    }
+    sqlite3_bind_int(q, 1, tmdb_id);
+
+    size_t cap = 4096;
+    size_t used = 0;
+    char *json = malloc(cap);
+    used += snprintf(json + used, cap - used, "[");
+
+    int first = 1;
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        int person_id = sqlite3_column_int(q, 0);
+        const char *name = (const char *)sqlite3_column_text(q, 1);
+        const char *character = (const char *)sqlite3_column_text(q, 2);
+        const char *profile = (const char *)sqlite3_column_text(q, 3);
+
+        char *n_esc = json_escape(name);
+        char *c_esc = json_escape(character);
+        char *p_esc = json_escape(profile && profile[0] ? profile : NULL);
+
+        if (used + 512 > cap) { cap *= 2; json = realloc(json, cap); }
+        used += snprintf(json + used, cap - used,
+            "%s{\"tmdb_person_id\":%d,\"name\":%s,\"character\":%s,\"profile\":%s}",
+            first ? "" : ",", person_id, n_esc, c_esc, p_esc);
+        first = 0;
+
+        free(n_esc); free(c_esc); free(p_esc);
+    }
+    sqlite3_finalize(q);
+
+    if (used + 2 > cap) { cap += 2; json = realloc(json, cap); }
+    json[used++] = ']';
+    json[used] = '\0';
+    return json;
+}
+
+int database_has_cast(int tmdb_id) {
+    if (tmdb_id <= 0) return 0;
+    sqlite3_stmt *st;
+    int has = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM media_cast WHERE tmdb_id=? LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, tmdb_id);
+        if (sqlite3_step(st) == SQLITE_ROW) has = 1;
+        sqlite3_finalize(st);
+    }
+    return has;
+}
+
+int database_get_entries_by_type(int media_type, MediaEntry **entries, int *count) {
+    const char *sql = "SELECT id, type, title, show_name, season, episode, filepath, year "
+                      "FROM media WHERE type=?";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(stmt, 1, media_type);
+
+    int n = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) n++;
+    sqlite3_reset(stmt);
+    sqlite3_bind_int(stmt, 1, media_type);
+
+    if (n == 0) {
+        *entries = NULL; *count = 0;
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    *entries = calloc(n, sizeof(MediaEntry));
+    *count = n;
+    int i = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && i < n) {
+        (*entries)[i].id = sqlite3_column_int(stmt, 0);
+        (*entries)[i].type = sqlite3_column_int(stmt, 1);
+        const char *t = (const char *)sqlite3_column_text(stmt, 2);
+        (*entries)[i].title = t ? strdup(t) : NULL;
+        const char *s = (const char *)sqlite3_column_text(stmt, 3);
+        (*entries)[i].show_name = s ? strdup(s) : NULL;
+        (*entries)[i].season = sqlite3_column_int(stmt, 4);
+        (*entries)[i].episode = sqlite3_column_int(stmt, 5);
+        const char *f = (const char *)sqlite3_column_text(stmt, 6);
+        (*entries)[i].filepath = f ? strdup(f) : NULL;
+        (*entries)[i].year = sqlite3_column_int(stmt, 7);
+        i++;
+    }
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+int database_get_entry(int id, MediaEntry *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    const char *sql = "SELECT id, type, title, show_name, season, episode, filepath, year "
+                      "FROM media WHERE id=?";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(stmt, 1, id);
+    int rc = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        out->id = sqlite3_column_int(stmt, 0);
+        out->type = sqlite3_column_int(stmt, 1);
+        const char *t = (const char *)sqlite3_column_text(stmt, 2);
+        out->title = t ? strdup(t) : NULL;
+        const char *s = (const char *)sqlite3_column_text(stmt, 3);
+        out->show_name = s ? strdup(s) : NULL;
+        out->season = sqlite3_column_int(stmt, 4);
+        out->episode = sqlite3_column_int(stmt, 5);
+        const char *f = (const char *)sqlite3_column_text(stmt, 6);
+        out->filepath = f ? strdup(f) : NULL;
+        out->year = sqlite3_column_int(stmt, 7);
+        rc = 0;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int database_collection_create(const char *name) {
+    if (!name || !name[0]) return -1;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "INSERT INTO collections(name) VALUES(?)", -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return -1;
+    return (int)sqlite3_last_insert_rowid(db);
+}
+
+int database_collection_delete(int collection_id) {
+    sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+    sqlite3_stmt *s1, *s2;
+    if (sqlite3_prepare_v2(db, "DELETE FROM collection_items WHERE collection_id=?", -1, &s1, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(s1, 1, collection_id); sqlite3_step(s1); sqlite3_finalize(s1);
+    }
+    int rc = -1;
+    if (sqlite3_prepare_v2(db, "DELETE FROM collections WHERE id=?", -1, &s2, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(s2, 1, collection_id);
+        if (sqlite3_step(s2) == SQLITE_DONE) rc = 0;
+        sqlite3_finalize(s2);
+    }
+    sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    return rc;
+}
+
+int database_collection_add_item(int collection_id, int media_id) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO collection_items(collection_id, media_id) VALUES(?, ?)",
+            -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(st, 1, collection_id);
+    sqlite3_bind_int(st, 2, media_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+int database_collection_remove_item(int collection_id, int media_id) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM collection_items WHERE collection_id=? AND media_id=?",
+            -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(st, 1, collection_id);
+    sqlite3_bind_int(st, 2, media_id);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+char *database_collections_list_json(void) {
+    /* [{id, name, count, poster, backdrop}] — poster/backdrop from first member. */
+    const char *sql =
+        "SELECT c.id, c.name, "
+        "  (SELECT COUNT(*) FROM collection_items ci WHERE ci.collection_id=c.id), "
+        "  (SELECT m.poster_path FROM collection_items ci JOIN media m ON m.id=ci.media_id "
+        "     WHERE ci.collection_id=c.id ORDER BY ci.ord, ci.media_id LIMIT 1), "
+        "  (SELECT m.backdrop_path FROM collection_items ci JOIN media m ON m.id=ci.media_id "
+        "     WHERE ci.collection_id=c.id ORDER BY ci.ord, ci.media_id LIMIT 1) "
+        "FROM collections c ORDER BY c.name";
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return strdup("[]");
+
+    size_t cap = 4096, used = 0;
+    char *json = malloc(cap);
+    used += snprintf(json + used, cap - used, "[");
+    int first = 1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int id = sqlite3_column_int(st, 0);
+        const char *name = (const char *)sqlite3_column_text(st, 1);
+        int count = sqlite3_column_int(st, 2);
+        const char *poster = (const char *)sqlite3_column_text(st, 3);
+        const char *backdrop = (const char *)sqlite3_column_text(st, 4);
+
+        char *n_esc = json_escape(name);
+        char *p_esc = json_escape(poster && poster[0] ? poster : NULL);
+        char *b_esc = json_escape(backdrop && backdrop[0] ? backdrop : NULL);
+
+        if (used + 1024 > cap) { cap *= 2; json = realloc(json, cap); }
+        used += snprintf(json + used, cap - used,
+            "%s{\"id\":%d,\"name\":%s,\"count\":%d,\"poster\":%s,\"backdrop\":%s}",
+            first ? "" : ",", id, n_esc, count, p_esc, b_esc);
+        first = 0;
+        free(n_esc); free(p_esc); free(b_esc);
+    }
+    sqlite3_finalize(st);
+    if (used + 2 > cap) { cap += 2; json = realloc(json, cap); }
+    json[used++] = ']';
+    json[used] = '\0';
+    return json;
+}
+
+char *database_collection_detail_json(int collection_id) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, name FROM collections WHERE id=?", -1, &st, NULL) != SQLITE_OK)
+        return NULL;
+    sqlite3_bind_int(st, 1, collection_id);
+    if (sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return NULL;
+    }
+    int id = sqlite3_column_int(st, 0);
+    char *name = json_escape((const char *)sqlite3_column_text(st, 1));
+    sqlite3_finalize(st);
+
+    /* Member ids */
+    sqlite3_stmt *qm;
+    if (sqlite3_prepare_v2(db,
+            "SELECT media_id FROM collection_items WHERE collection_id=? ORDER BY ord, media_id",
+            -1, &qm, NULL) != SQLITE_OK) {
+        free(name);
+        return NULL;
+    }
+    sqlite3_bind_int(qm, 1, collection_id);
+
+    size_t cap = 8192, used = 0;
+    char *json = malloc(cap);
+    used += snprintf(json + used, cap - used,
+        "{\"id\":%d,\"name\":%s,\"items\":[", id, name);
+    free(name);
+
+    int first = 1;
+    while (sqlite3_step(qm) == SQLITE_ROW) {
+        int mid = sqlite3_column_int(qm, 0);
+        char *m = database_get_media_json(mid);
+        if (m) {
+            if (used + strlen(m) + 16 > cap) {
+                cap = (used + strlen(m) + 4096);
+                json = realloc(json, cap);
+            }
+            used += snprintf(json + used, cap - used, "%s%s", first ? "" : ",", m);
+            first = 0;
+            free(m);
+        }
+    }
+    sqlite3_finalize(qm);
+
+    if (used + 4 > cap) { cap += 4; json = realloc(json, cap); }
+    used += snprintf(json + used, cap - used, "]}");
     return json;
 }

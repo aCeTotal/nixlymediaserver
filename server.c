@@ -242,6 +242,22 @@ static void *tmdb_rescan_thread(void *arg) {
     return NULL;
 }
 
+static void *tmdb_rescrape_movies_thread(void *arg) {
+    (void)arg;
+    scanner_scrape_session_begin(&tmdb_progress);
+    scanner_rescrape_by_type(0);
+    scanner_scrape_session_end(&tmdb_progress);
+    return NULL;
+}
+
+static void *tmdb_rescrape_tvshows_thread(void *arg) {
+    (void)arg;
+    scanner_scrape_session_begin(&tmdb_progress);
+    scanner_rescrape_by_type(2);
+    scanner_scrape_session_end(&tmdb_progress);
+    return NULL;
+}
+
 static void *scrape_tmdb_thread(void *arg) {
     (void)arg;
     printf("Scrape: TMDB thread started\n");
@@ -922,6 +938,137 @@ static void handle_api(int fd, const char *method, const char *path,
                          "{\"status\":\"failed to start rescan\"}", 35);
         }
     }
+    else if (strcmp(path, "/api/collections") == 0 && strcmp(method, "GET") == 0) {
+        char *json = database_collections_list_json();
+        send_response(fd, 200, "OK", "application/json", json, strlen(json));
+        free(json);
+    }
+    else if (strcmp(path, "/api/collections") == 0 && strcmp(method, "POST") == 0) {
+        char name[256] = "";
+        if (body && body_len > 0) {
+            char *b = strndup(body, body_len);
+            for (char *tok = strtok(b, "&"); tok; tok = strtok(NULL, "&")) {
+                char *eq = strchr(tok, '=');
+                if (!eq) continue;
+                *eq = '\0';
+                if (strcmp(tok, "name") == 0) {
+                    /* URL-decode in place into name[] */
+                    char *src = eq + 1;
+                    size_t di = 0;
+                    while (*src && di + 1 < sizeof(name)) {
+                        if (src[0] == '%' && src[1] && src[2]) {
+                            char h[3] = { src[1], src[2], 0 };
+                            name[di++] = (char)strtol(h, NULL, 16);
+                            src += 3;
+                        } else if (*src == '+') {
+                            name[di++] = ' '; src++;
+                        } else {
+                            name[di++] = *src++;
+                        }
+                    }
+                    name[di] = '\0';
+                }
+            }
+            free(b);
+        }
+        if (!name[0]) {
+            send_error(fd, 400, "Missing name");
+        } else {
+            int id = database_collection_create(name);
+            char resp[128];
+            int rlen = snprintf(resp, sizeof(resp),
+                "{\"ok\":%s,\"id\":%d}", id > 0 ? "true" : "false", id);
+            send_response(fd, id > 0 ? 200 : 500, id > 0 ? "OK" : "Failed",
+                          "application/json", resp, rlen);
+        }
+    }
+    else if (strncmp(path, "/api/collections/", 17) == 0) {
+        int cid = atoi(path + 17);
+        const char *rest = strchr(path + 17, '/');
+        if (cid <= 0) { send_error(fd, 400, "Bad id"); }
+        else if (!rest && strcmp(method, "GET") == 0) {
+            char *json = database_collection_detail_json(cid);
+            if (!json) send_error(fd, 404, "Not found");
+            else {
+                send_response(fd, 200, "OK", "application/json", json, strlen(json));
+                free(json);
+            }
+        }
+        else if (!rest && strcmp(method, "DELETE") == 0) {
+            int ok = database_collection_delete(cid) == 0;
+            send_response(fd, ok ? 200 : 500, ok ? "OK" : "Failed",
+                          "application/json",
+                          ok ? "{\"ok\":true}" : "{\"ok\":false}",
+                          ok ? 11 : 12);
+        }
+        else if (rest && strncmp(rest, "/items", 6) == 0) {
+            const char *after = rest + 6;
+            if (*after == '\0' && strcmp(method, "POST") == 0) {
+                int media_id = 0;
+                if (body && body_len > 0) {
+                    char *b = strndup(body, body_len);
+                    for (char *tok = strtok(b, "&"); tok; tok = strtok(NULL, "&")) {
+                        char *eq = strchr(tok, '=');
+                        if (!eq) continue;
+                        *eq = '\0';
+                        if (strcmp(tok, "media_id") == 0) media_id = atoi(eq + 1);
+                    }
+                    free(b);
+                }
+                if (media_id <= 0) send_error(fd, 400, "Missing media_id");
+                else {
+                    int ok = database_collection_add_item(cid, media_id) == 0;
+                    send_response(fd, ok ? 200 : 500, ok ? "OK" : "Failed",
+                                  "application/json",
+                                  ok ? "{\"ok\":true}" : "{\"ok\":false}",
+                                  ok ? 11 : 12);
+                }
+            }
+            else if (*after == '/' && strcmp(method, "DELETE") == 0) {
+                int mid = atoi(after + 1);
+                int ok = database_collection_remove_item(cid, mid) == 0;
+                send_response(fd, ok ? 200 : 500, ok ? "OK" : "Failed",
+                              "application/json",
+                              ok ? "{\"ok\":true}" : "{\"ok\":false}",
+                              ok ? 11 : 12);
+            } else {
+                send_error(fd, 405, "Method not allowed");
+            }
+        } else {
+            send_error(fd, 404, "Not found");
+        }
+    }
+    else if (strncmp(path, "/api/tmdb/rescrape/", 19) == 0) {
+        int id = atoi(path + 19);
+        int ok = scanner_rescrape_one(id);
+        char body[64];
+        int n = snprintf(body, sizeof(body), "{\"status\":\"%s\",\"id\":%d}",
+                         ok ? "ok" : "failed", id);
+        send_response(fd, ok ? 200 : 500, ok ? "OK" : "Internal Server Error",
+                      "application/json", body, n);
+    }
+    else if (strcmp(path, "/api/tmdb/rescrape_movies") == 0) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, tmdb_rescrape_movies_thread, NULL) == 0) {
+            pthread_detach(th);
+            send_response(fd, 200, "OK", "application/json",
+                         "{\"status\":\"started\"}", 20);
+        } else {
+            send_response(fd, 500, "Internal Server Error", "application/json",
+                         "{\"status\":\"failed\"}", 19);
+        }
+    }
+    else if (strcmp(path, "/api/tmdb/rescrape_tvshows") == 0) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, tmdb_rescrape_tvshows_thread, NULL) == 0) {
+            pthread_detach(th);
+            send_response(fd, 200, "OK", "application/json",
+                         "{\"status\":\"started\"}", 20);
+        } else {
+            send_response(fd, 500, "Internal Server Error", "application/json",
+                         "{\"status\":\"failed\"}", 19);
+        }
+    }
     else if (strncmp(path, "/api/media/", 11) == 0) {
         /* Get media info by ID */
         int id = atoi(path + 11);
@@ -1383,6 +1530,14 @@ static void handle_request(int fd, const char *request,
     else if (strcmp(path, "/pending") == 0) {
         send_response(fd, 200, "OK", "text/html",
                       page_pending_html, strlen(page_pending_html));
+    }
+    else if (strcmp(path, "/rescrape") == 0) {
+        send_response(fd, 200, "OK", "text/html",
+                      page_rescrape_html, strlen(page_rescrape_html));
+    }
+    else if (strcmp(path, "/collections") == 0) {
+        send_response(fd, 200, "OK", "text/html",
+                      page_collections_html, strlen(page_collections_html));
     }
     else {
         send_error(fd, 404, "Not Found");

@@ -673,3 +673,60 @@ void tmdb_free_episode(TmdbEpisode *e) {
     free(e->air_date);
     free(e);
 }
+
+#define TMDB_MAX_CAST 15
+
+TmdbCastMember *tmdb_get_credits(int id, int is_tv, int *count_out) {
+    if (count_out) *count_out = 0;
+    if (id <= 0) return NULL;
+
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/%s/%d/credits",
+             is_tv ? "tv" : "movie", id);
+
+    char *response = tmdb_request(endpoint);
+    if (!response) return NULL;
+
+    cJSON *json = cJSON_Parse(response);
+    free(response);
+    if (!json) return NULL;
+
+    cJSON *cast = cJSON_GetObjectItem(json, "cast");
+    if (!cast || !cJSON_IsArray(cast)) {
+        cJSON_Delete(json);
+        return NULL;
+    }
+
+    int n = cJSON_GetArraySize(cast);
+    if (n > TMDB_MAX_CAST) n = TMDB_MAX_CAST;
+    if (n <= 0) {
+        cJSON_Delete(json);
+        return NULL;
+    }
+
+    TmdbCastMember *out = calloc(n, sizeof(TmdbCastMember));
+    int written = 0;
+    for (int i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(cast, i);
+        if (!item) continue;
+        out[written].tmdb_person_id = get_int(item, "id");
+        out[written].name = get_string(item, "name");
+        out[written].character = get_string(item, "character");
+        out[written].profile_path = get_string(item, "profile_path");
+        written++;
+    }
+
+    cJSON_Delete(json);
+    if (count_out) *count_out = written;
+    return out;
+}
+
+void tmdb_free_cast(TmdbCastMember *cast, int count) {
+    if (!cast) return;
+    for (int i = 0; i < count; i++) {
+        free(cast[i].name);
+        free(cast[i].character);
+        free(cast[i].profile_path);
+    }
+    free(cast);
+}

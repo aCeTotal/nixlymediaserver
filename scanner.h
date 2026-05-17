@@ -52,6 +52,12 @@ void scanner_fetch_missing_tmdb(void);
 /* Re-fetch TMDB metadata for ALL entries (full rescan) */
 void scanner_rescan_all_tmdb(void);
 
+/* Re-scrape a single media entry (refetch metadata + cast). 1 on success. */
+int scanner_rescrape_one(int media_id);
+
+/* Re-scrape all entries of a given media type (0=movies, 1/2=tv). */
+void scanner_rescrape_by_type(int media_type);
+
 /* Search TMDB for a movie by raw title string.
  * Returns TmdbMovie* on success (caller must tmdb_free_movie()), NULL on failure.
  * Used by downloads.c for pre-validation before moving files. */

@@ -31,6 +31,13 @@ typedef struct {
     int64_t bitrate;
     char *added_date;
 
+    /* Per-file tech properties extracted by scanner */
+    char *hdr_format;     /* HDR10, HDR10+, HLG, DV, DV+HDR10 */
+    int bit_depth;
+    int audio_channels;
+    char *audio_layout;   /* "2.0", "5.1", "7.1" */
+    char *audio_features; /* "atmos", "joc", "dts-x" comma-sep */
+
     /* TMDB metadata */
     int tmdb_id;          /* TMDB movie/show ID */
     char *tmdb_title;     /* Title from TMDB */
@@ -106,6 +113,12 @@ int database_get_entries_without_tmdb(MediaEntry **entries, int *count);
 /* Get all entries for full TMDB rescan */
 int database_get_all_entries(MediaEntry **entries, int *count);
 
+/* Get all entries of a specific media type. */
+int database_get_entries_by_type(int media_type, MediaEntry **entries, int *count);
+
+/* Get a single entry by id (caller frees with database_free_entry). */
+int database_get_entry(int id, MediaEntry *out);
+
 /* JSON exports for API */
 char *database_get_library_json(void);
 char *database_get_movies_json(void);
@@ -141,5 +154,30 @@ int database_watch_progress_update(const char *ip, int media_id,
 
 /* JSON map of {media_id: percent} for the given IP. Caller frees. */
 char *database_watch_progress_json_for_ip(const char *ip);
+
+/* Cast member (actor) for a movie or TV show. */
+typedef struct {
+    int tmdb_person_id;
+    char *name;
+    char *character;
+    char *profile_path;   /* Local cached path or empty */
+} CastEntry;
+
+/* Replace all cast for a tmdb_id (movie tmdb_id or show tmdb_show_id). */
+int database_replace_cast(int tmdb_id, CastEntry *entries, int count);
+
+/* Returns 1 if any cast row exists for tmdb_id, else 0. */
+int database_has_cast(int tmdb_id);
+
+/* Get cast JSON array for a media row id. Caller frees. */
+char *database_get_cast_json(int media_id);
+
+/* --- Collections --- */
+int database_collection_create(const char *name);  /* returns new id, -1 on error */
+int database_collection_delete(int collection_id);
+int database_collection_add_item(int collection_id, int media_id);
+int database_collection_remove_item(int collection_id, int media_id);
+char *database_collections_list_json(void);              /* [{id,name,count,poster}] */
+char *database_collection_detail_json(int collection_id); /* {id,name,items:[...]} */
 
 #endif /* DATABASE_H */

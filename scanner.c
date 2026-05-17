@@ -16,6 +16,8 @@
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/dict.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/channel_layout.h>
 
 #include "scanner.h"
 #include "database.h"
@@ -720,6 +722,43 @@ TmdbMovie *scanner_search_movie_tmdb(const char *title) {
     return movie;
 }
 
+/* Thread-local flag set during rescrape paths to force credits refresh. */
+static __thread int force_cast_refresh = 0;
+
+/* Fetch credits + download profile images + store. Skips if already stored. */
+static void scanner_fetch_and_store_cast(int tmdb_id, int is_tv) {
+    if (tmdb_id <= 0) return;
+    if (!force_cast_refresh && database_has_cast(tmdb_id)) return;
+
+    int count = 0;
+    TmdbCastMember *cast = tmdb_get_credits(tmdb_id, is_tv, &count);
+    if (!cast || count == 0) {
+        if (cast) tmdb_free_cast(cast, count);
+        return;
+    }
+
+    CastEntry *entries = calloc(count, sizeof(CastEntry));
+    for (int i = 0; i < count; i++) {
+        entries[i].tmdb_person_id = cast[i].tmdb_person_id;
+        entries[i].name = cast[i].name;
+        entries[i].character = cast[i].character;
+        entries[i].profile_path = NULL;
+        if (cast[i].profile_path) {
+            entries[i].profile_path = tmdb_download_image(cast[i].profile_path,
+                                                          "w185",
+                                                          server_config.cache_dir);
+        }
+    }
+    database_replace_cast(tmdb_id, entries, count);
+    printf("  TMDB: Stored %d cast members for tmdb_id %d\n", count, tmdb_id);
+
+    for (int i = 0; i < count; i++) {
+        free(entries[i].profile_path);
+    }
+    free(entries);
+    tmdb_free_cast(cast, count);
+}
+
 /* Apply TMDB movie data to a database entry (download images, update DB) */
 void scanner_apply_movie_tmdb(int db_id, TmdbMovie *movie) {
     MediaEntry tmdb_data = {0};
@@ -745,6 +784,8 @@ void scanner_apply_movie_tmdb(int db_id, TmdbMovie *movie) {
 
     printf("  TMDB: Found \"%s\" (%d) - %.1f/10\n",
            movie->title, movie->year, movie->rating);
+
+    scanner_fetch_and_store_cast(movie->tmdb_id, 0);
 
     free(tmdb_data.poster_path);
     free(tmdb_data.backdrop_path);
@@ -886,6 +927,8 @@ static int fetch_episode_with_show(int db_id, TmdbTvShow *show, int season, int 
 
     database_update_tmdb(db_id, &tmdb_data);
 
+    scanner_fetch_and_store_cast(show->tmdb_id, 1);
+
     if (ep) tmdb_free_episode(ep);
     free(tmdb_data.poster_path);
     free(tmdb_data.backdrop_path);
@@ -963,6 +1006,13 @@ int scanner_scan_file(const char *filepath, int fetch_tmdb) {
     /* Bitrate */
     entry.bitrate = fmt_ctx->bit_rate;
 
+    /* Tech-property buffers (heap so they survive past loop and can be freed by DB layer) */
+    char *hdr_buf = NULL;
+    char *audio_layout_buf = NULL;
+    char *audio_features_buf = NULL;
+    int bit_depth_val = 0;
+    int audio_channels_val = 0;
+
     /* Find video and audio streams */
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
         AVStream *stream = fmt_ctx->streams[i];
@@ -975,14 +1025,108 @@ int scanner_scan_file(const char *filepath, int fetch_tmdb) {
             if (codec) {
                 entry.codec_video = (char *)codec->name;
             }
+
+            /* Bit depth from pixel format */
+            if (codecpar->format != AV_PIX_FMT_NONE) {
+                const AVPixFmtDescriptor *pix = av_pix_fmt_desc_get(codecpar->format);
+                if (pix && pix->nb_components > 0) {
+                    bit_depth_val = pix->comp[0].depth;
+                }
+            }
+
+            /* HDR detection from color trc + Dolby Vision side data */
+            int has_pq = (codecpar->color_trc == AVCOL_TRC_SMPTE2084);
+            int has_hlg = (codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67);
+            int has_dv = 0;
+            for (int s = 0; s < codecpar->nb_coded_side_data; s++) {
+                if (codecpar->coded_side_data[s].type == AV_PKT_DATA_DOVI_CONF) {
+                    has_dv = 1;
+                    break;
+                }
+            }
+            if (has_dv && has_pq) hdr_buf = strdup("DV+HDR10");
+            else if (has_dv) hdr_buf = strdup("DV");
+            else if (has_pq) hdr_buf = strdup("HDR10");
+            else if (has_hlg) hdr_buf = strdup("HLG");
         }
         else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !entry.codec_audio) {
             const AVCodec *codec = avcodec_find_decoder(codecpar->codec_id);
             if (codec) {
                 entry.codec_audio = (char *)codec->name;
             }
+
+            int nb = codecpar->ch_layout.nb_channels;
+            audio_channels_val = nb;
+            /* Map common channel counts to dotted layout */
+            const char *lay = NULL;
+            switch (nb) {
+                case 1: lay = "1.0"; break;
+                case 2: lay = "2.0"; break;
+                case 3: lay = "2.1"; break;
+                case 6: lay = "5.1"; break;
+                case 7: lay = "6.1"; break;
+                case 8: lay = "7.1"; break;
+                case 10: lay = "7.1.2"; break;
+                case 12: lay = "7.1.4"; break;
+                default: break;
+            }
+            if (lay) audio_layout_buf = strdup(lay);
+
+            /* Atmos / DTS-X / TrueHD detection */
+            char feat[64] = {0};
+            int has_feat = 0;
+            /* EAC3 JOC profile = Atmos (FF_PROFILE_EAC3_DDP_ATMOS = 30 in newer ffmpeg) */
+            if (codecpar->codec_id == AV_CODEC_ID_EAC3 && codecpar->profile > 0) {
+                strcat(feat, "joc,atmos");
+                has_feat = 1;
+            }
+            /* TrueHD profile flag for Atmos */
+            if (codecpar->codec_id == AV_CODEC_ID_TRUEHD && codecpar->profile > 0) {
+                if (has_feat) strcat(feat, ",");
+                strcat(feat, "atmos");
+                has_feat = 1;
+            }
+            /* DTS-HD MA / DTS-X — codec is dts, profile flags */
+            if (codecpar->codec_id == AV_CODEC_ID_DTS) {
+                if (codecpar->profile == AV_PROFILE_DTS_HD_MA) {
+                    if (has_feat) strcat(feat, ",");
+                    strcat(feat, "dts-hd-ma");
+                    has_feat = 1;
+                } else if (codecpar->profile == AV_PROFILE_DTS_HD_MA_X ||
+                           codecpar->profile == AV_PROFILE_DTS_HD_MA_X_IMAX) {
+                    if (has_feat) strcat(feat, ",");
+                    strcat(feat, "dts-x");
+                    has_feat = 1;
+                }
+            }
+            /* Stream metadata fallback (e.g. "title=Atmos 5.1.4") */
+            if (!has_feat) {
+                AVDictionaryEntry *t = av_dict_get(stream->metadata, "title", NULL, 0);
+                if (t && t->value) {
+                    for (const char *p = t->value; *p; p++) {
+                        if (strncasecmp(p, "atmos", 5) == 0) {
+                            strcpy(feat, "atmos");
+                            has_feat = 1;
+                            break;
+                        }
+                        if (strncasecmp(p, "dts:x", 5) == 0 ||
+                            strncasecmp(p, "dts-x", 5) == 0) {
+                            strcpy(feat, "dts-x");
+                            has_feat = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (has_feat) audio_features_buf = strdup(feat);
         }
     }
+
+    entry.hdr_format = hdr_buf;
+    entry.bit_depth = bit_depth_val;
+    entry.audio_channels = audio_channels_val;
+    entry.audio_layout = audio_layout_buf;
+    entry.audio_features = audio_features_buf;
 
     /* Determine type and extract title */
     char title[256];
@@ -1008,6 +1152,10 @@ int scanner_scan_file(const char *filepath, int fetch_tmdb) {
 
     int db_id = database_add_media(&entry);
     avformat_close_input(&fmt_ctx);
+
+    free(hdr_buf);
+    free(audio_layout_buf);
+    free(audio_features_buf);
 
     /* Fetch TMDB metadata in background or immediately */
     if (fetch_tmdb && db_id > 0 && server_config.tmdb_api_key[0]) {
@@ -1190,6 +1338,89 @@ void scanner_rescan_all_tmdb(void) {
     printf("TMDB full rescan complete\n");
 }
 
+int scanner_rescrape_one(int media_id) {
+    if (!server_config.tmdb_api_key[0]) return 0;
+
+    MediaEntry e = {0};
+    if (database_get_entry(media_id, &e) != 0) return 0;
+
+    force_cast_refresh = 1;
+    int ok = 0;
+    if (e.type == MEDIA_TYPE_MOVIE) {
+        char fresh_title[256];
+        if (e.filepath) {
+            scanner_extract_title(e.filepath, fresh_title, sizeof(fresh_title));
+            ok = fetch_movie_metadata(e.id, fresh_title);
+        } else if (e.title) {
+            ok = fetch_movie_metadata(e.id, e.title);
+        }
+    } else if ((e.type == MEDIA_TYPE_EPISODE || e.type == MEDIA_TYPE_TVSHOW) && e.show_name) {
+        ok = fetch_episode_metadata(e.id, e.show_name, e.season, e.episode, e.year);
+    }
+    force_cast_refresh = 0;
+    database_free_entry(&e);
+    return ok > 0 ? 1 : 0;
+}
+
+void scanner_rescrape_by_type(int media_type) {
+    if (!server_config.tmdb_api_key[0]) return;
+    MediaEntry *entries = NULL;
+    int count = 0;
+    if (media_type == MEDIA_TYPE_MOVIE) {
+        database_get_entries_by_type(MEDIA_TYPE_MOVIE, &entries, &count);
+    } else {
+        MediaEntry *ep = NULL, *sh = NULL;
+        int ec = 0, sc = 0;
+        database_get_entries_by_type(MEDIA_TYPE_EPISODE, &ep, &ec);
+        database_get_entries_by_type(MEDIA_TYPE_TVSHOW, &sh, &sc);
+        count = ec + sc;
+        entries = calloc(count > 0 ? count : 1, sizeof(MediaEntry));
+        if (ec > 0) memcpy(entries, ep, ec * sizeof(MediaEntry));
+        if (sc > 0) memcpy(entries + ec, sh, sc * sizeof(MediaEntry));
+        free(ep);
+        free(sh);
+    }
+    if (count == 0) {
+        free(entries);
+        return;
+    }
+
+    scrape_begin(&tmdb_progress,
+                 media_type == MEDIA_TYPE_MOVIE ? "rescrape_movies" : "rescrape_tvshows",
+                 count);
+    force_cast_refresh = 1;
+    for (int i = 0; i < count; i++) {
+        MediaEntry *e = &entries[i];
+        char live_label[320];
+        if (e->type != MEDIA_TYPE_MOVIE && e->show_name && e->season > 0 && e->episode > 0) {
+            snprintf(live_label, sizeof(live_label), "%s S%02dE%02d",
+                     e->show_name, e->season, e->episode);
+        } else {
+            snprintf(live_label, sizeof(live_label), "%s",
+                     e->show_name ? e->show_name : (e->title ? e->title : "?"));
+        }
+        scrape_set_current(&tmdb_progress, live_label);
+
+        int ok = 0;
+        if (e->type == MEDIA_TYPE_MOVIE) {
+            char fresh[256];
+            if (e->filepath) {
+                scanner_extract_title(e->filepath, fresh, sizeof(fresh));
+                ok = fetch_movie_metadata(e->id, fresh);
+            } else if (e->title) {
+                ok = fetch_movie_metadata(e->id, e->title);
+            }
+        } else if (e->show_name) {
+            ok = fetch_episode_metadata(e->id, e->show_name, e->season, e->episode, e->year);
+        }
+        scrape_update(&tmdb_progress, live_label, ok > 0);
+        database_free_entry(e);
+    }
+    force_cast_refresh = 0;
+    free(entries);
+    scrape_end(&tmdb_progress);
+}
+
 void scanner_refresh_show_status(void) {
     if (!server_config.tmdb_api_key[0]) return;
 
@@ -1232,20 +1463,25 @@ int scanner_apply_manual_tmdb(int media_id, int media_type,
                               int tmdb_id, int season, int episode) {
     if (!server_config.tmdb_api_key[0] || tmdb_id <= 0) return 0;
 
+    force_cast_refresh = 1;
+
     if (media_type == MEDIA_TYPE_MOVIE) {
         TmdbMovie *m = tmdb_get_movie_by_id(tmdb_id);
         if (!m) {
+            force_cast_refresh = 0;
             error_log("tmdb", "Manual override: movie id %d not found", tmdb_id);
             return 0;
         }
         scanner_apply_movie_tmdb(media_id, m);
         tmdb_free_movie(m);
+        force_cast_refresh = 0;
         return 1;
     }
 
     if (media_type == MEDIA_TYPE_EPISODE || media_type == MEDIA_TYPE_TVSHOW) {
         TmdbTvShow *show = tmdb_get_tvshow_by_id(tmdb_id);
         if (!show) {
+            force_cast_refresh = 0;
             error_log("tmdb", "Manual override: show id %d not found", tmdb_id);
             return 0;
         }
@@ -1253,6 +1489,7 @@ int scanner_apply_manual_tmdb(int media_id, int media_type,
             ? fetch_episode_with_show(media_id, show, season, episode)
             : 0;
         tmdb_free_tvshow(show);
+        force_cast_refresh = 0;
         return ok;
     }
 

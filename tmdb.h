@@ -86,6 +86,20 @@ TmdbMovie *tmdb_get_movie_by_id(int tmdb_id);
 /* Get TV show details by TMDB ID (no search, direct lookup) */
 TmdbTvShow *tmdb_get_tvshow_by_id(int tmdb_id);
 
+typedef struct {
+    int tmdb_person_id;
+    char *name;
+    char *character;
+    char *profile_path;   /* TMDB profile path (e.g. /abc.jpg), may be NULL */
+} TmdbCastMember;
+
+/* Fetch credits for a movie (is_tv=0) or tv show (is_tv=1).
+ * Returns array sorted by TMDB order; count_out set. Limited to first ~15.
+ * Caller frees via tmdb_free_cast.
+ */
+TmdbCastMember *tmdb_get_credits(int id, int is_tv, int *count_out);
+void tmdb_free_cast(TmdbCastMember *cast, int count);
+
 /* Free result structures */
 void tmdb_free_movie(TmdbMovie *m);
 void tmdb_free_tvshow(TmdbTvShow *t);
