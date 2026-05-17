@@ -36,7 +36,10 @@ typedef struct {
     char dest_path[DOWNLOAD_URL_LEN];
     int64_t total_bytes;
     int64_t downloaded_bytes;
-    int64_t speed_bps;
+    int64_t speed_bps;            /* live for active, final avg for done */
+    /* Sampling state for live-speed EMA. Updated from libcurl progress_cb. */
+    double last_sample_time;      /* CLOCK_MONOTONIC seconds */
+    int64_t last_sample_bytes;
     char error[256];
     pthread_t thread;
     int thread_started;

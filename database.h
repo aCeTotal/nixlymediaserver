@@ -134,4 +134,12 @@ int database_load_blocked_ips(uint32_t **ips, int *count);
 int database_add_blocked_ip(const char *ip_str);
 int database_remove_blocked_ip(const char *ip_str);
 
+/* Watch-progress tracking. max_offset is the highest byte the client has
+ * requested from /stream/<id> (proxy for furthest position watched). */
+int database_watch_progress_update(const char *ip, int media_id,
+                                   int64_t max_offset, int64_t file_size);
+
+/* JSON map of {media_id: percent} for the given IP. Caller frees. */
+char *database_watch_progress_json_for_ip(const char *ip);
+
 #endif /* DATABASE_H */

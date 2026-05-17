@@ -63,6 +63,12 @@ void scanner_extract_title(const char *filepath, char *title, size_t title_size)
 /* Apply pre-fetched TMDB movie data to a database entry */
 void scanner_apply_movie_tmdb(int db_id, TmdbMovie *movie);
 
+/* Manual override: fetch by explicit TMDB id and apply.
+ * For movies, season/episode are ignored. For episodes, both required.
+ * Returns 1 on success, 0 on failure. */
+int scanner_apply_manual_tmdb(int media_id, int media_type,
+                              int tmdb_id, int season, int episode);
+
 /* Refresh show status (status + next_episode_date) for active shows */
 void scanner_refresh_show_status(void);
 

@@ -13,6 +13,7 @@
 
 #include "downloads.h"
 #include "config.h"
+#include "errors.h"
 
 static DownloadSlot slots[DOWNLOAD_MAX_SLOTS];
 static pthread_mutex_t slots_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -45,13 +46,38 @@ static void extract_filename_from_url(const char *url, char *out, size_t out_siz
     *w = '\0';
 }
 
+static double mono_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 static int progress_cb(void *userdata, curl_off_t dltotal, curl_off_t dlnow,
                        curl_off_t ultotal, curl_off_t ulnow) {
     (void)ultotal; (void)ulnow;
     DownloadSlot *slot = (DownloadSlot *)userdata;
+    double now = mono_now();
     pthread_mutex_lock(&slots_lock);
     slot->total_bytes = (int64_t)dltotal;
     slot->downloaded_bytes = (int64_t)dlnow;
+
+    /* Sample at most ~2× per second to keep EMA noise low. */
+    if (slot->last_sample_time == 0.0) {
+        slot->last_sample_time = now;
+        slot->last_sample_bytes = (int64_t)dlnow;
+    } else {
+        double dt = now - slot->last_sample_time;
+        if (dt >= 0.5) {
+            int64_t db = (int64_t)dlnow - slot->last_sample_bytes;
+            if (db < 0) db = 0;
+            int64_t inst = (int64_t)((double)db / dt);
+            /* EMA: smooth out brief stalls/spikes. */
+            if (slot->speed_bps <= 0) slot->speed_bps = inst;
+            else slot->speed_bps = (int64_t)(0.3 * (double)inst + 0.7 * (double)slot->speed_bps);
+            slot->last_sample_time = now;
+            slot->last_sample_bytes = (int64_t)dlnow;
+        }
+    }
     pthread_mutex_unlock(&slots_lock);
     return 0;
 }
@@ -128,6 +154,7 @@ static void *download_thread(void *arg) {
     } else {
         slot->state = DL_STATE_FAILED;
         snprintf(slot->error, sizeof(slot->error), "%s", curl_easy_strerror(rc));
+        error_log("download", "%s — %s", slot->filename, curl_easy_strerror(rc));
         remove(tmp_path);
     }
     pthread_mutex_unlock(&slots_lock);
@@ -248,10 +275,17 @@ char *downloads_status_json(void) {
         if (!first) buf[used++] = ',';
         first = 0;
 
+        int64_t eta = -1;
+        if (s->state == DL_STATE_ACTIVE && s->speed_bps > 0 && s->total_bytes > 0) {
+            int64_t remaining = s->total_bytes - s->downloaded_bytes;
+            if (remaining < 0) remaining = 0;
+            eta = remaining / s->speed_bps;
+        }
+
         used += snprintf(buf + used, cap - used,
             "{\"id\":%d,\"type\":\"%s\",\"state\":\"%s\","
             "\"filename\":\"%s\",\"total\":%lld,\"downloaded\":%lld,"
-            "\"percent\":%.1f,\"speed_bps\":%lld,\"error\":\"%s\"}",
+            "\"percent\":%.1f,\"speed_bps\":%lld,\"eta\":%lld,\"error\":\"%s\"}",
             s->id,
             s->type == DL_TYPE_TV ? "tv" : "movie",
             st, fn_esc,
@@ -259,6 +293,7 @@ char *downloads_status_json(void) {
             (long long)s->downloaded_bytes,
             pct,
             (long long)s->speed_bps,
+            (long long)eta,
             err_esc);
     }
     pthread_mutex_unlock(&slots_lock);

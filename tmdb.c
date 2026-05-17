@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include "tmdb.h"
 #include "config.h"
+#include "errors.h"
 #include <cjson/cJSON.h>
 
 #define TMDB_API_BASE "https://api.themoviedb.org/3"
@@ -69,6 +70,7 @@ static char *tmdb_request_lang(const char *endpoint, const char *lang) {
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         fprintf(stderr, "TMDB request failed: %s\n", curl_easy_strerror(res));
+        error_log("tmdb", "Request failed: %s", curl_easy_strerror(res));
         free(chunk.data);
         return NULL;
     }

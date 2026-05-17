@@ -21,6 +21,7 @@
 #include "database.h"
 #include "tmdb.h"
 #include "config.h"
+#include "errors.h"
 
 #define SCRAPE_PROGRESS_INIT { \
     .active = 0, .operation = "idle", .current_item = "", \
@@ -76,6 +77,16 @@ static void scrape_update(ScrapeProgress *p, const char *item, int ok) {
         strncpy(p->current_item, item, sizeof(p->current_item) - 1);
         p->current_item[sizeof(p->current_item) - 1] = '\0';
     }
+    pthread_mutex_unlock(&p->lock);
+}
+
+/* Set the in-flight item label before work starts, so the UI shows what's
+ * being scraped right now instead of the last finished item. */
+static void scrape_set_current(ScrapeProgress *p, const char *item) {
+    if (!item) return;
+    pthread_mutex_lock(&p->lock);
+    strncpy(p->current_item, item, sizeof(p->current_item) - 1);
+    p->current_item[sizeof(p->current_item) - 1] = '\0';
     pthread_mutex_unlock(&p->lock);
 }
 
@@ -701,8 +712,11 @@ TmdbMovie *scanner_search_movie_tmdb(const char *title) {
         }
     }
 
-    if (!movie)
+    if (!movie) {
         printf("  TMDB: No match found after %d attempts\n", var_count);
+        error_log("tmdb", "Movie: no match for \"%s\" (year %d, %d tries)",
+                  clean, year, var_count);
+    }
     return movie;
 }
 
@@ -866,6 +880,8 @@ static int fetch_episode_with_show(int db_id, TmdbTvShow *show, int season, int 
     } else {
         tmdb_data.tmdb_id = show->tmdb_id;
         printf("  TMDB: Found show \"%s\", episode not found\n", show->name);
+        error_log("tmdb", "Episode not found: %s S%02dE%02d",
+                  show->name, season, episode);
     }
 
     database_update_tmdb(db_id, &tmdb_data);
@@ -897,6 +913,8 @@ static int fetch_episode_metadata(int db_id, const char *show_name, int season, 
 
     if (!show) {
         printf("  TMDB: Show not found after %d attempts\n", var_count);
+        error_log("tmdb", "Show not found: \"%s\" S%02dE%02d (year %d, %d tries)",
+                  show_name, season, episode, year, var_count);
         return 0;
     }
 
@@ -918,6 +936,7 @@ int scanner_scan_file(const char *filepath, int fetch_tmdb) {
         char err[256];
         av_strerror(ret, err, sizeof(err));
         fprintf(stderr, "  Warning: Cannot open %s: %s\n", filepath, err);
+        error_log("scanner", "Cannot open file: %s (%s)", filepath, err);
         return -1;
     }
 
@@ -1059,6 +1078,14 @@ void scanner_fetch_missing_tmdb(void) {
     for (int i = 0; i < count; i++) {
         MediaEntry *e = &entries[i];
         const char *name = e->show_name ? e->show_name : e->title;
+        char live_label[320];
+        if (e->type != MEDIA_TYPE_MOVIE && e->show_name && e->season > 0 && e->episode > 0) {
+            snprintf(live_label, sizeof(live_label), "%s S%02dE%02d",
+                     e->show_name, e->season, e->episode);
+        } else {
+            snprintf(live_label, sizeof(live_label), "%s", name ? name : "?");
+        }
+        scrape_set_current(&tmdb_progress, live_label);
         int ok = 0;
 
         if (e->type == MEDIA_TYPE_MOVIE) {
@@ -1087,7 +1114,7 @@ void scanner_fetch_missing_tmdb(void) {
             }
         }
 
-        scrape_update(&tmdb_progress, name ? name : "?", ok > 0);
+        scrape_update(&tmdb_progress, live_label, ok > 0);
         database_free_entry(e);
     }
 
@@ -1132,6 +1159,14 @@ void scanner_rescan_all_tmdb(void) {
     for (int i = 0; i < count; i++) {
         MediaEntry *e = &entries[i];
         const char *name = e->show_name ? e->show_name : e->title;
+        char live_label[320];
+        if (e->type != MEDIA_TYPE_MOVIE && e->show_name && e->season > 0 && e->episode > 0) {
+            snprintf(live_label, sizeof(live_label), "%s S%02dE%02d",
+                     e->show_name, e->season, e->episode);
+        } else {
+            snprintf(live_label, sizeof(live_label), "%s", name ? name : "?");
+        }
+        scrape_set_current(&tmdb_progress, live_label);
         int ok = 0;
 
         if (e->type == MEDIA_TYPE_MOVIE) {
@@ -1146,7 +1181,7 @@ void scanner_rescan_all_tmdb(void) {
             ok = fetch_episode_metadata(e->id, e->show_name, e->season, e->episode, e->year);
         }
 
-        scrape_update(&tmdb_progress, name ? name : "?", ok > 0);
+        scrape_update(&tmdb_progress, live_label, ok > 0);
         database_free_entry(e);
     }
 
@@ -1191,5 +1226,36 @@ void scanner_refresh_show_status(void) {
     free(ids);
     scrape_end(&tmdb_progress);
     printf("Show status refresh complete\n");
+}
+
+int scanner_apply_manual_tmdb(int media_id, int media_type,
+                              int tmdb_id, int season, int episode) {
+    if (!server_config.tmdb_api_key[0] || tmdb_id <= 0) return 0;
+
+    if (media_type == MEDIA_TYPE_MOVIE) {
+        TmdbMovie *m = tmdb_get_movie_by_id(tmdb_id);
+        if (!m) {
+            error_log("tmdb", "Manual override: movie id %d not found", tmdb_id);
+            return 0;
+        }
+        scanner_apply_movie_tmdb(media_id, m);
+        tmdb_free_movie(m);
+        return 1;
+    }
+
+    if (media_type == MEDIA_TYPE_EPISODE || media_type == MEDIA_TYPE_TVSHOW) {
+        TmdbTvShow *show = tmdb_get_tvshow_by_id(tmdb_id);
+        if (!show) {
+            error_log("tmdb", "Manual override: show id %d not found", tmdb_id);
+            return 0;
+        }
+        int ok = (season > 0 && episode > 0)
+            ? fetch_episode_with_show(media_id, show, season, episode)
+            : 0;
+        tmdb_free_tvshow(show);
+        return ok;
+    }
+
+    return 0;
 }
 

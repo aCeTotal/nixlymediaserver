@@ -9,5 +9,7 @@
 extern const char *page_index_html;
 extern const char *page_status_html;
 extern const char *page_wget_html;
+extern const char *page_errors_html;
+extern const char *page_pending_html;
 
 #endif /* PAGES_H */

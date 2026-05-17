@@ -33,6 +33,7 @@
 #include "watcher.h"
 #include "downloads.h"
 #include "pages.h"
+#include "errors.h"
 
 /* No connection limit - kernel handles backlog */
 #define BUFFER_SIZE 1048576  /* 1MB for efficient streaming */
@@ -956,30 +957,120 @@ static void handle_api(int fd, const char *method, const char *path,
 
         int media_count = database_get_count();
 
+        /* Pull pending entries first so we know the count and items before
+         * building the JSON. Capped sample of labels goes in pending_items. */
         MediaEntry *tmdb_entries = NULL;
         int tmdb_pending = 0;
-        if (database_get_entries_without_tmdb(&tmdb_entries, &tmdb_pending) == 0) {
-            for (int i = 0; i < tmdb_pending; i++)
-                database_free_entry(&tmdb_entries[i]);
-            free(tmdb_entries);
-        }
+        database_get_entries_without_tmdb(&tmdb_entries, &tmdb_pending);
 
-        char json[2048];
-        int len = snprintf(json, sizeof(json),
+        const int max_items = 50;
+        size_t items_sz = 4096;
+        char *items = malloc(items_sz);
+        items[0] = '\0';
+        size_t items_len = 0;
+        int emitted = 0;
+
+        for (int i = 0; i < tmdb_pending && emitted < max_items; i++) {
+            MediaEntry *e = &tmdb_entries[i];
+            char label[640];
+            const char *show = e->show_name ? e->show_name : "";
+            const char *title = e->title ? e->title : "";
+            if (e->type != MEDIA_TYPE_MOVIE && *show && e->season > 0 && e->episode > 0) {
+                snprintf(label, sizeof(label), "%s S%02dE%02d",
+                         show, e->season, e->episode);
+            } else if (e->type != MEDIA_TYPE_MOVIE && *show) {
+                snprintf(label, sizeof(label), "%s — %s", show, title);
+            } else {
+                snprintf(label, sizeof(label), "%s", title);
+            }
+            char esc[1300];
+            char *d = esc;
+            for (const char *s = label; *s && d < esc + sizeof(esc) - 6; s++) {
+                if (*s == '"') { *d++ = '\\'; *d++ = '"'; }
+                else if (*s == '\\') { *d++ = '\\'; *d++ = '\\'; }
+                else if ((unsigned char)*s >= 0x20) *d++ = *s;
+            }
+            *d = '\0';
+            size_t need = strlen(esc) + 8;
+            if (items_len + need > items_sz) {
+                items_sz = (items_len + need) * 2;
+                items = realloc(items, items_sz);
+            }
+            items_len += snprintf(items + items_len, items_sz - items_len,
+                                  "%s{\"id\":%d,\"type\":%d,\"season\":%d,\"episode\":%d,\"label\":\"%s\"}",
+                                  emitted ? "," : "", e->id, e->type,
+                                  e->season, e->episode, esc);
+            emitted++;
+        }
+        for (int i = 0; i < tmdb_pending; i++)
+            database_free_entry(&tmdb_entries[i]);
+        free(tmdb_entries);
+
+        size_t buf_sz = 2048 + items_len;
+        char *json = malloc(buf_sz);
+        int len = snprintf(json, buf_sz,
             "{\"tmdb\":{\"active\":%s,\"operation\":\"%s\",\"current_item\":\"%s\","
             "\"total\":%d,\"processed\":%d,\"success\":%d,\"failed\":%d,"
             "\"percent\":%.1f,\"elapsed\":%d},"
-            "\"media_count\":%d,\"tmdb_pending\":%d}",
+            "\"media_count\":%d,\"tmdb_pending\":%d,"
+            "\"pending_items\":[%s],\"pending_truncated\":%s}",
             t_active ? "true" : "false", t_operation, t_esc,
             t_total, t_processed, t_success, t_failed, t_percent, t_elapsed,
-            media_count, tmdb_pending);
+            media_count, tmdb_pending,
+            items, tmdb_pending > max_items ? "true" : "false");
         send_response(fd, 200, "OK", "application/json", json, len);
+        free(items);
+        free(json);
     }
     else if (strcmp(path, "/api/counts") == 0) {
         char json[256];
         int len = snprintf(json, sizeof(json),
             "{\"total\":%d}", database_get_count());
         send_response(fd, 200, "OK", "application/json", json, len);
+    }
+    else if (strcmp(path, "/api/errors") == 0) {
+        char *json = errors_get_json();
+        if (json) {
+            send_response(fd, 200, "OK", "application/json", json, strlen(json));
+            free(json);
+        } else {
+            send_error(fd, 500, "Error log unavailable");
+        }
+    }
+    else if (strcmp(path, "/api/errors/clear") == 0 && strcmp(method, "POST") == 0) {
+        errors_clear();
+        send_response(fd, 200, "OK", "application/json", "{\"ok\":true}", 11);
+    }
+    else if (strncmp(path, "/api/media/", 11) == 0 &&
+             strstr(path, "/tmdb") && strcmp(method, "POST") == 0) {
+        /* /api/media/<id>/tmdb — manual TMDB override.
+         * Body: tmdb_id=N&type=M&season=S&episode=E (season/episode for episodes) */
+        int media_id = atoi(path + 11);
+        int tmdb_id = 0, mtype = 0, season = 0, episode = 0;
+        if (body && body_len > 0) {
+            char *b = strndup(body, body_len);
+            for (char *tok = strtok(b, "&"); tok; tok = strtok(NULL, "&")) {
+                char *eq = strchr(tok, '=');
+                if (!eq) continue;
+                *eq = '\0';
+                int v = atoi(eq + 1);
+                if (strcmp(tok, "tmdb_id") == 0) tmdb_id = v;
+                else if (strcmp(tok, "type") == 0) mtype = v;
+                else if (strcmp(tok, "season") == 0) season = v;
+                else if (strcmp(tok, "episode") == 0) episode = v;
+            }
+            free(b);
+        }
+        if (media_id <= 0 || tmdb_id <= 0) {
+            send_error(fd, 400, "Missing media_id or tmdb_id");
+        } else {
+            int ok = scanner_apply_manual_tmdb(media_id, mtype, tmdb_id, season, episode);
+            char resp[64];
+            int rlen = snprintf(resp, sizeof(resp), "{\"ok\":%s}",
+                                ok ? "true" : "false");
+            send_response(fd, ok ? 200 : 500, ok ? "OK" : "Failed",
+                          "application/json", resp, rlen);
+        }
     }
     else if (strcmp(path, "/api/streams/active") == 0) {
         /* Rich snapshot — IP, what they're watching, poster, since when. */
@@ -1256,13 +1347,22 @@ static void handle_request(int fd, const char *request,
         }
     }
     else if (strncmp(path, "/image/", 7) == 0) {
-        /* Serve cached image — URL-decode filename (e.g. %20 → space) */
+        /* Serve cached image — URL-decode then reduce to basename.
+         * Legacy DB rows store absolute paths in poster_path; new rows may
+         * store just the filename. Either way, only the basename is used,
+         * always resolved under cache_dir. Blocks path traversal. */
         char decoded[MAX_PATH];
         url_decode(path + 7, decoded, sizeof(decoded));
-        char filepath[MAX_PATH];
-        snprintf(filepath, sizeof(filepath), "%s/%s",
-                 server_config.cache_dir, decoded);
-        serve_file(fd, filepath);
+        const char *slash = strrchr(decoded, '/');
+        const char *name = slash ? slash + 1 : decoded;
+        if (*name == '\0' || strstr(name, "..")) {
+            send_error(fd, 400, "Bad image name");
+        } else {
+            char filepath[MAX_PATH];
+            snprintf(filepath, sizeof(filepath), "%s/%s",
+                     server_config.cache_dir, name);
+            serve_file(fd, filepath);
+        }
     }
     else if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
         send_response(fd, 200, "OK", "text/html",
@@ -1275,6 +1375,14 @@ static void handle_request(int fd, const char *request,
     else if (strcmp(path, "/wget") == 0) {
         send_response(fd, 200, "OK", "text/html",
                       page_wget_html, strlen(page_wget_html));
+    }
+    else if (strcmp(path, "/errors") == 0) {
+        send_response(fd, 200, "OK", "text/html",
+                      page_errors_html, strlen(page_errors_html));
+    }
+    else if (strcmp(path, "/pending") == 0) {
+        send_response(fd, 200, "OK", "text/html",
+                      page_pending_html, strlen(page_pending_html));
     }
     else {
         send_error(fd, 404, "Not Found");

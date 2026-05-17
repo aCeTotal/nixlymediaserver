@@ -98,7 +98,18 @@ int database_init(const char *db_path) {
         "CREATE INDEX IF NOT EXISTS idx_type ON media(type);"
         "CREATE INDEX IF NOT EXISTS idx_show ON media(show_name);"
         "CREATE INDEX IF NOT EXISTS idx_filepath ON media(filepath);"
-        "CREATE INDEX IF NOT EXISTS idx_tmdb ON media(tmdb_id);";
+        "CREATE INDEX IF NOT EXISTS idx_tmdb ON media(tmdb_id);"
+        /* Per-client byte-offset progress. PRIMARY KEY (ip, media_id) so
+         * UPSERT works. max_offset only grows; reset by client deletion. */
+        "CREATE TABLE IF NOT EXISTS watch_progress("
+        "  ip TEXT NOT NULL,"
+        "  media_id INTEGER NOT NULL,"
+        "  max_offset INTEGER NOT NULL DEFAULT 0,"
+        "  file_size INTEGER NOT NULL DEFAULT 0,"
+        "  updated_at INTEGER NOT NULL,"
+        "  PRIMARY KEY (ip, media_id)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wp_media ON watch_progress(media_id);";
 
     char *err_msg = NULL;
     rc = sqlite3_exec(db, sql, NULL, NULL, &err_msg);
