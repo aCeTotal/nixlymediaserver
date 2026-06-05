@@ -49,6 +49,18 @@ static int discovery_fd = -1;
 static volatile int running = 1;
 static volatile int startup_scanning = 0;  /* 1 while initial scan/TMDB fetch is running */
 
+/* Per-thread keep-alive state. client_handler setter denne fra request-Connection-
+ * headeren før hver response. send_response/serve_file/stream_file leser den for å
+ * skrive ærlig "Connection: keep-alive" eller "close". Default 0 (close) — trygt
+ * fallback hvis kallet skjer utenfor client_handler. */
+static __thread int t_keep_alive = 0;
+
+/* Idle-timeout per keep-alive-socket. Etter at en response er ferdig venter
+ * client_handler på neste request i denne tida; deretter close. mpv reconnect_
+ * delay_max=5 betyr at klient åpner ny connection raskt ved behov, så 30s er
+ * romslig nok for sekvensiell playback uten å holde tomme tråder unødig. */
+#define KEEPALIVE_IDLE_SECS 30
+
 /* Concurrent streaming gate — at most MAX_STREAM_IPS distinct client IPs
  * may stream at once. The same IP can open any number of streams (tabs,
  * range requests, multiple files) without counting against the limit.
@@ -529,6 +541,8 @@ static int check_auth(const char *request) {
 }
 
 static void send_401(int fd) {
+    /* Auth-feil = alltid close. Klient må reautentisere på ny connection. */
+    t_keep_alive = 0;
     const char *body = "Authentication required";
     size_t body_len = strlen(body);
     char header[MAX_HEADER];
@@ -546,15 +560,16 @@ static void send_401(int fd) {
 /* HTTP response helpers */
 static void send_response(int fd, int status, const char *status_text,
                           const char *content_type, const char *body, size_t body_len) {
+    const char *conn_val = t_keep_alive ? "keep-alive" : "close";
     char header[MAX_HEADER];
     int header_len = snprintf(header, sizeof(header),
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Access-Control-Allow-Origin: *\r\n"
-        "Connection: close\r\n"
+        "Connection: %s\r\n"
         "\r\n",
-        status, status_text, content_type, body_len);
+        status, status_text, content_type, body_len, conn_val);
 
     write(fd, header, header_len);
     if (body && body_len > 0) {
@@ -604,6 +619,7 @@ static void serve_file(int fd, const char *filepath) {
     }
 
     const char *mime = get_mime_type(filepath);
+    const char *conn_val = t_keep_alive ? "keep-alive" : "close";
     char header[MAX_HEADER];
     int header_len = snprintf(header, sizeof(header),
         "HTTP/1.1 200 OK\r\n"
@@ -611,9 +627,9 @@ static void serve_file(int fd, const char *filepath) {
         "Content-Length: %ld\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Cache-Control: max-age=86400\r\n"
-        "Connection: close\r\n"
+        "Connection: %s\r\n"
         "\r\n",
-        mime, st.st_size);
+        mime, st.st_size, conn_val);
 
     write(fd, header, header_len);
 
@@ -673,6 +689,7 @@ static void stream_file(int fd, const char *filepath, const char *range_header) 
     char header[MAX_HEADER];
     int header_len;
 
+    const char *conn_val = t_keep_alive ? "keep-alive" : "close";
     if (partial) {
         header_len = snprintf(header, sizeof(header),
             "HTTP/1.1 206 Partial Content\r\n"
@@ -681,9 +698,9 @@ static void stream_file(int fd, const char *filepath, const char *range_header) 
             "Content-Range: bytes %ld-%ld/%ld\r\n"
             "Accept-Ranges: bytes\r\n"
             "Access-Control-Allow-Origin: *\r\n"
-            "Connection: keep-alive\r\n"
+            "Connection: %s\r\n"
             "\r\n",
-            mime, content_length, start, end, st.st_size);
+            mime, content_length, start, end, st.st_size, conn_val);
     } else {
         header_len = snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
@@ -691,9 +708,9 @@ static void stream_file(int fd, const char *filepath, const char *range_header) 
             "Content-Length: %ld\r\n"
             "Accept-Ranges: bytes\r\n"
             "Access-Control-Allow-Origin: *\r\n"
-            "Connection: keep-alive\r\n"
+            "Connection: %s\r\n"
             "\r\n",
-            mime, st.st_size);
+            mime, st.st_size, conn_val);
     }
 
     write(fd, header, header_len);
@@ -1561,11 +1578,30 @@ static void optimize_socket(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 }
 
-/* Client handler thread */
+/* Forhandler keep-alive ut fra request-linja og Connection-headeren.
+ * HTTP/1.1 default = keep-alive; HTTP/1.0 default = close. Eksplisitt
+ * "Connection: close" overstyrer alltid; "keep-alive" på 1.0 likeså.
+ * Vi godtar både CRLF og bar LF før header-navnet. */
+static int request_wants_keep_alive(const char *headers) {
+    int http11 = (strstr(headers, " HTTP/1.1\r\n") != NULL);
+    const char *conn = strcasestr(headers, "\nConnection:");
+    if (conn) {
+        conn += 12;
+        while (*conn == ' ' || *conn == '\t') conn++;
+        if (strncasecmp(conn, "close", 5) == 0) return 0;
+        if (strncasecmp(conn, "keep-alive", 10) == 0) return 1;
+    }
+    return http11 ? 1 : 0;
+}
+
+/* Client handler thread.
+ *
+ * Holder TCP-connection åpen mellom requests så lenge klient og protokoll
+ * tilsier keep-alive. mpv/ffmpeg over HTTP/1.1 utsteder Range-requests for
+ * seek; uten ekte keep-alive ble hver Range en full handshake + ny pthread,
+ * og klientens TIME_WAIT-bøtte fyltes raskt under lengre playback. */
 static void *client_handler(void *arg) {
     ClientConnection *conn = (ClientConnection *)arg;
-    char buffer[MAX_HEADER];
-    int is_stream = 0;
 
     /* Set thread-local request context for API handlers */
     config_set_client_local(is_local_client(&conn->client_addr));
@@ -1574,22 +1610,43 @@ static void *client_handler(void *arg) {
     /* Optimize socket for streaming before handling request */
     optimize_socket(conn->client_fd);
 
-    /* Read headers until \r\n\r\n */
-    ssize_t total = 0;
-    char *header_end = NULL;
-    while (total < (ssize_t)sizeof(buffer) - 1) {
-        ssize_t n = recv(conn->client_fd, buffer + total, sizeof(buffer) - 1 - total, 0);
-        if (n <= 0) break;
-        total += n;
-        buffer[total] = '\0';
-        header_end = strstr(buffer, "\r\n\r\n");
-        if (header_end) break;
-    }
+    /* Idle-timeout mellom keep-alive-requests. Hvis klient ikke sender ny
+     * request innen vinduet, recv returnerer -1/EAGAIN og vi lukker. Holder
+     * tomme tråder fra å akkumulere på inaktive sockets. */
+    struct timeval tv = { .tv_sec = KEEPALIVE_IDLE_SECS, .tv_usec = 0 };
+    setsockopt(conn->client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    if (total > 0 && header_end) {
+    /* Buffer rommer 1 oversized header pluss eventuell pipelined byte-rest
+     * fra forrige request som ennå ikke er parsed. */
+    char buffer[MAX_HEADER * 2];
+    ssize_t pending = 0;
+    uint32_t client_ip = conn->client_addr.sin_addr.s_addr;
+
+    while (running) {
+        /* Sjekk om vi allerede har komplett header fra forrige iterasjon. */
+        char *header_end = NULL;
+        if (pending > 0) {
+            buffer[pending] = '\0';
+            header_end = strstr(buffer, "\r\n\r\n");
+        }
+        /* Les til vi har \r\n\r\n eller buffer er full eller socket lukket. */
+        while (!header_end && pending < (ssize_t)sizeof(buffer) - 1) {
+            ssize_t n = recv(conn->client_fd, buffer + pending,
+                             sizeof(buffer) - 1 - pending, 0);
+            if (n <= 0) goto done;  /* disconnect, timeout, eller feil */
+            pending += n;
+            buffer[pending] = '\0';
+            header_end = strstr(buffer, "\r\n\r\n");
+        }
+        if (!header_end) goto done;  /* oversized headers — drop */
+
         size_t header_len = (header_end - buffer) + 4;
 
-        /* Parse Content-Length, then read remaining body */
+        /* Sett keep-alive-state FØR vi sender response — alle response-
+         * helpere leser t_keep_alive for å skrive ærlig Connection-header. */
+        t_keep_alive = request_wants_keep_alive(buffer);
+
+        /* Parse Content-Length, deretter les body. */
         char *body_buf = NULL;
         size_t body_len = 0;
         const char *cl = strcasestr(buffer, "Content-Length:");
@@ -1601,14 +1658,20 @@ static void *client_handler(void *arg) {
                 body_len = (size_t)n;
                 body_buf = malloc(body_len + 1);
                 if (body_buf) {
-                    size_t have = total - header_len;
+                    size_t have = pending - header_len;
                     if (have > body_len) have = body_len;
                     if (have > 0) memcpy(body_buf, buffer + header_len, have);
                     size_t got = have;
                     while (got < body_len) {
                         ssize_t r = recv(conn->client_fd, body_buf + got,
                                          body_len - got, 0);
-                        if (r <= 0) break;
+                        if (r <= 0) {
+                            /* Body-read brutt — vi kan ikke fortsette
+                             * keep-alive uten kjent end-of-message. */
+                            t_keep_alive = 0;
+                            body_len = got;
+                            break;
+                        }
                         got += r;
                     }
                     body_len = got;
@@ -1618,32 +1681,28 @@ static void *client_handler(void *arg) {
         }
 
         if (!check_auth(buffer)) {
-            send_401(conn->client_fd);
+            send_401(conn->client_fd);  /* setter t_keep_alive=0 internt */
             if (body_buf) free(body_buf);
-            close(conn->client_fd);
-            free(conn);
-            return NULL;
+            goto done;
         }
 
-        uint32_t client_ip = conn->client_addr.sin_addr.s_addr;
+        int is_stream = 0;
         char *stream_pos = strstr(buffer, "/stream/");
         if (stream_pos) {
             int rc = stream_ip_acquire(client_ip);
             if (rc == -2) {
+                t_keep_alive = 0;
                 send_error(conn->client_fd, 403,
                     "Blocked — your IP has been temporarily restricted");
                 if (body_buf) free(body_buf);
-                close(conn->client_fd);
-                free(conn);
-                return NULL;
+                goto done;
             }
             if (rc == -1) {
+                t_keep_alive = 0;
                 send_error(conn->client_fd, 503,
                     "Server closed — max 3 concurrent IPs streaming");
                 if (body_buf) free(body_buf);
-                close(conn->client_fd);
-                free(conn);
-                return NULL;
+                goto done;
             }
             is_stream = 1;
             /* Pull rich metadata for the admin UI (title/show/poster). */
@@ -1657,8 +1716,23 @@ static void *client_handler(void *arg) {
         if (is_stream) {
             stream_ip_release(client_ip);
         }
+
+        if (!t_keep_alive) break;
+
+        /* Shift evt. pipelined bytes (start på neste request) til
+         * front av bufferen. Med ærlig Content-Length kjenner vi
+         * eksakt grensa — alt etter er forrige iters overflow. */
+        size_t consumed = header_len + body_len;
+        if ((ssize_t)consumed >= pending) {
+            pending = 0;
+        } else {
+            ssize_t leftover = pending - (ssize_t)consumed;
+            memmove(buffer, buffer + consumed, leftover);
+            pending = leftover;
+        }
     }
 
+done:
     close(conn->client_fd);
     free(conn);
     return NULL;

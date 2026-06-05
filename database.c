@@ -1486,14 +1486,19 @@ int database_collection_remove_item(int collection_id, int media_id) {
 }
 
 char *database_collections_list_json(void) {
-    /* [{id, name, count, poster, backdrop}] — poster/backdrop from first member. */
+    /* [{id, name, count, poster, backdrop}] — poster/backdrop from member with
+     * the earliest release_date (rows missing release_date sort last). */
     const char *sql =
         "SELECT c.id, c.name, "
         "  (SELECT COUNT(*) FROM collection_items ci WHERE ci.collection_id=c.id), "
         "  (SELECT m.poster_path FROM collection_items ci JOIN media m ON m.id=ci.media_id "
-        "     WHERE ci.collection_id=c.id ORDER BY ci.ord, ci.media_id LIMIT 1), "
+        "     WHERE ci.collection_id=c.id "
+        "     ORDER BY (CASE WHEN m.release_date IS NULL OR m.release_date='' THEN 1 ELSE 0 END), "
+        "              m.release_date ASC, ci.media_id LIMIT 1), "
         "  (SELECT m.backdrop_path FROM collection_items ci JOIN media m ON m.id=ci.media_id "
-        "     WHERE ci.collection_id=c.id ORDER BY ci.ord, ci.media_id LIMIT 1) "
+        "     WHERE ci.collection_id=c.id "
+        "     ORDER BY (CASE WHEN m.release_date IS NULL OR m.release_date='' THEN 1 ELSE 0 END), "
+        "              m.release_date ASC, ci.media_id LIMIT 1) "
         "FROM collections c ORDER BY c.name";
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return strdup("[]");
@@ -1541,10 +1546,14 @@ char *database_collection_detail_json(int collection_id) {
     char *name = json_escape((const char *)sqlite3_column_text(st, 1));
     sqlite3_finalize(st);
 
-    /* Member ids */
+    /* Member ids — ordered by release_date (earliest first; unknown last). */
     sqlite3_stmt *qm;
     if (sqlite3_prepare_v2(db,
-            "SELECT media_id FROM collection_items WHERE collection_id=? ORDER BY ord, media_id",
+            "SELECT ci.media_id FROM collection_items ci "
+            "JOIN media m ON m.id=ci.media_id "
+            "WHERE ci.collection_id=? "
+            "ORDER BY (CASE WHEN m.release_date IS NULL OR m.release_date='' THEN 1 ELSE 0 END), "
+            "         m.release_date ASC, ci.media_id",
             -1, &qm, NULL) != SQLITE_OK) {
         free(name);
         return NULL;
