@@ -838,19 +838,12 @@ static void handle_api(int fd, const char *method, const char *path,
 
         if (seasons_pos) {
             /* Extract show name (URL decoded) */
+            char raw_name[256];
             size_t name_len = seasons_pos - show_start;
-            if (name_len >= sizeof(show_name)) name_len = sizeof(show_name) - 1;
-            strncpy(show_name, show_start, name_len);
-            show_name[name_len] = '\0';
-
-            /* Simple URL decode for spaces */
-            for (char *p = show_name; *p; p++) {
-                if (*p == '+') *p = ' ';
-                else if (*p == '%' && p[1] == '2' && p[2] == '0') {
-                    *p = ' ';
-                    memmove(p + 1, p + 3, strlen(p + 3) + 1);
-                }
-            }
+            if (name_len >= sizeof(raw_name)) name_len = sizeof(raw_name) - 1;
+            strncpy(raw_name, show_start, name_len);
+            raw_name[name_len] = '\0';
+            url_decode(raw_name, show_name, sizeof(show_name));
 
             char *json = database_get_show_seasons_json(show_name);
             if (json) {
@@ -861,20 +854,13 @@ static void handle_api(int fd, const char *method, const char *path,
             }
         }
         else if (episodes_pos) {
-            /* Extract show name */
+            /* Extract show name (URL decoded) */
+            char raw_name[256];
             size_t name_len = episodes_pos - show_start;
-            if (name_len >= sizeof(show_name)) name_len = sizeof(show_name) - 1;
-            strncpy(show_name, show_start, name_len);
-            show_name[name_len] = '\0';
-
-            /* Simple URL decode */
-            for (char *p = show_name; *p; p++) {
-                if (*p == '+') *p = ' ';
-                else if (*p == '%' && p[1] == '2' && p[2] == '0') {
-                    *p = ' ';
-                    memmove(p + 1, p + 3, strlen(p + 3) + 1);
-                }
-            }
+            if (name_len >= sizeof(raw_name)) name_len = sizeof(raw_name) - 1;
+            strncpy(raw_name, show_start, name_len);
+            raw_name[name_len] = '\0';
+            url_decode(raw_name, show_name, sizeof(show_name));
 
             int season = atoi(episodes_pos + 10);
             char *json = database_get_show_episodes_json(show_name, season);
