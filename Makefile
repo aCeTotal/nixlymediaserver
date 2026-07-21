@@ -13,7 +13,7 @@ CJSON_LIBS = $(shell pkg-config --libs libcjson 2>/dev/null)
 CFLAGS += $(FFMPEG_CFLAGS) $(CJSON_CFLAGS)
 LDFLAGS += $(FFMPEG_LIBS) $(CJSON_LIBS)
 
-SRC = server.c database.c scanner.c config.c tmdb.c watcher.c downloads.c pages.c errors.c
+SRC = server.c database.c scanner.c config.c tmdb.c watcher.c downloads.c pages.c errors.c keepalive.c
 OBJ = $(SRC:.c=.o)
 TARGET = nixly-server
 

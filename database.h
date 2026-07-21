@@ -98,6 +98,11 @@ int database_get_version(void);
 /* Get filepath by media ID */
 char *database_get_filepath(int id);
 
+/* One representative filepath whose absolute path begins with `prefix`
+ * (disk keepalive uses it to wake the disk that media root lives on).
+ * Returns malloc'd string or NULL if no match. */
+char *database_get_sample_filepath(const char *prefix);
+
 /* Lightweight metadata lookup for the live-stream admin view.
  * All out buffers may be empty strings if no data is available.
  * Returns 0 on success, -1 if id not found. */

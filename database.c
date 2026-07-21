@@ -514,6 +514,33 @@ int database_get_stream_meta(int id,
     return rc;
 }
 
+char *database_get_sample_filepath(const char *prefix) {
+    /* Exact prefix-match (substr, ikke LIKE — path kan inneholde _ og %
+     * som er LIKE-wildcards). Én representant per media-rot brukes av
+     * disk-keepalive til å vekke disken den roten ligger på. */
+    const char *sql =
+        "SELECT filepath FROM media WHERE substr(filepath,1,?)=? LIMIT 1";
+    sqlite3_stmt *stmt;
+
+    if (!prefix || !*prefix) return NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return NULL;
+    }
+    sqlite3_bind_int(stmt, 1, (int)strlen(prefix));
+    sqlite3_bind_text(stmt, 2, prefix, -1, SQLITE_STATIC);
+
+    char *filepath = NULL;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *path = (const char *)sqlite3_column_text(stmt, 0);
+        if (path) {
+            filepath = strdup(path);
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    return filepath;
+}
+
 char *database_get_filepath(int id) {
     const char *sql = "SELECT filepath FROM media WHERE id = ?";
     sqlite3_stmt *stmt;

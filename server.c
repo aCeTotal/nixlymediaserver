@@ -34,6 +34,7 @@
 #include "downloads.h"
 #include "pages.h"
 #include "errors.h"
+#include "keepalive.h"
 
 /* No connection limit - kernel handles backlog */
 #define BUFFER_SIZE 1048576  /* 1MB for efficient streaming */
@@ -1487,6 +1488,10 @@ static void handle_request(int fd, const char *request,
     }
     else if (strncmp(path, "/stream/", 8) == 0) {
         /* Stream media file by ID */
+        /* Media-aktivitet: hold alle media-disker våkne et vindu framover
+         * så pauser / mellom-episode-gap ikke lar en disk spinne ned og
+         * stalle neste read. Klienten poker /stream jevnlig når aktiv. */
+        keepalive_notify_activity();
         int id = atoi(path + 8);
         char *filepath = database_get_filepath(id);
         if (filepath) {
@@ -1930,6 +1935,9 @@ int main(int argc, char *argv[]) {
     } else {
         pthread_detach(sync_tid);
     }
+
+    /* Hold media-disker våkne mens en klient streamer (spindown-frys-fix). */
+    keepalive_start();
 
     /* Start initial scan in background - server responds immediately with
      * whatever is already in the database while scan populates new entries */
