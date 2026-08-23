@@ -8,6 +8,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <curl/curl.h>
 
@@ -44,6 +45,39 @@ static void extract_filename_from_url(const char *url, char *out, size_t out_siz
         }
     }
     *w = '\0';
+}
+
+/* Free bytes on the filesystem holding `path`. The directory may not exist
+ * yet, so walk up to the nearest existing ancestor. */
+static unsigned long long free_bytes(const char *path) {
+    char buf[MAX_PATH_LEN];
+    strncpy(buf, path, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    for (;;) {
+        struct statvfs v;
+        if (statvfs(buf, &v) == 0)
+            return (unsigned long long)v.f_bavail * v.f_frsize;
+        char *slash = strrchr(buf, '/');
+        if (!slash || slash == buf) return 0;
+        *slash = '\0';
+    }
+}
+
+/* Per download: the configured primary/secondary destination whose disk has
+ * the most free space. Empty secondary means primary only. */
+static const char *pick_dest_base(const char *primary, const char *secondary) {
+    if (!secondary[0]) return primary;
+    return free_bytes(secondary) > free_bytes(primary) ? secondary : primary;
+}
+
+static void mkdir_p(const char *path) {
+    char buf[DOWNLOAD_URL_LEN];
+    strncpy(buf, path, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(buf, 0755); *p = '/'; }
+    }
+    mkdir(buf, 0755);
 }
 
 static double mono_now(void) {
@@ -93,10 +127,14 @@ static void *download_thread(void *arg) {
     slot->state = DL_STATE_ACTIVE;
     pthread_mutex_unlock(&slots_lock);
 
-    mkdir(slot->type == DL_TYPE_TV
-            ? server_config.tv_download_path
-            : server_config.movie_download_path,
-          0755);
+    char dest_dir[sizeof(slot->dest_path)];
+    strncpy(dest_dir, slot->dest_path, sizeof(dest_dir) - 1);
+    dest_dir[sizeof(dest_dir) - 1] = '\0';
+    char *last_slash = strrchr(dest_dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        mkdir_p(dest_dir);
+    }
 
     /* Write to a .nixlypart temp file, then atomic rename when complete.
      * Watcher skips .nixlypart so scanner only sees the file once it's whole. */
@@ -204,8 +242,8 @@ int downloads_add(const char *url, DownloadType type) {
     extract_filename_from_url(url, slot->filename, sizeof(slot->filename));
 
     const char *base = (type == DL_TYPE_TV)
-        ? server_config.tv_download_path
-        : server_config.movie_download_path;
+        ? pick_dest_base(server_config.tv_download_path, server_config.tv_download_path2)
+        : pick_dest_base(server_config.movie_download_path, server_config.movie_download_path2);
     snprintf(slot->dest_path, sizeof(slot->dest_path), "%s/%s", base, slot->filename);
 
     if (pthread_create(&slot->thread, NULL, download_thread, slot) != 0) {

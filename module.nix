@@ -15,6 +15,8 @@ let
     tmdb_language = ${cfg.tmdbLanguage}
     tv_download_path = ${cfg.tvDownloadPath}
     movie_download_path = ${cfg.movieDownloadPath}
+    tv_download_path2 = ${cfg.tvDownloadPath2}
+    movie_download_path2 = ${cfg.movieDownloadPath2}
     auth_user = ${cfg.authUser}
     auth_password = ${cfg.authPassword}
     ${lib.concatMapStringsSep "\n"
@@ -71,6 +73,18 @@ in {
       type = lib.types.str;
       default = "/var/lib/nixly-server/Movies";
       description = "Destination for movie downloads via /wget.";
+    };
+
+    tvDownloadPath2 = lib.mkOption {
+      type = lib.types.str;
+      default = "/mnt/bigdisk2/media/TV";
+      description = "Secondary TV destination on another disk; per download the disk with the most free space wins. Empty disables.";
+    };
+
+    movieDownloadPath2 = lib.mkOption {
+      type = lib.types.str;
+      default = "/mnt/bigdisk2/media/Movies";
+      description = "Secondary movie destination on another disk; per download the disk with the most free space wins. Empty disables.";
     };
 
     authUser = lib.mkOption {

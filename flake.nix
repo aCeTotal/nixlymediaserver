@@ -21,6 +21,10 @@
           src = ./.;
 
           nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
+
+          # Repo can contain stale .o files; store timestamps are all equal
+          # so make would link them instead of recompiling.
+          preBuild = "make clean";
           buildInputs = with pkgs; [
             ffmpeg-headless
             sqlite

@@ -70,6 +70,8 @@ void config_init_defaults(void) {
 
     strcpy(server_config.tv_download_path, "/mnt/bigdisk1/www/aceclan/media/TV");
     strcpy(server_config.movie_download_path, "/mnt/bigdisk1/www/aceclan/media/Movies");
+    strcpy(server_config.tv_download_path2, "/mnt/bigdisk2/media/TV");
+    strcpy(server_config.movie_download_path2, "/mnt/bigdisk2/media/Movies");
 
     strcpy(server_config.auth_user, "nixly");
     strcpy(server_config.auth_password, "nixlyadmin");
@@ -139,6 +141,12 @@ int config_load(const char *path) {
         else if (strcmp(key, "movie_download_path") == 0) {
             expand_path(value, server_config.movie_download_path, sizeof(server_config.movie_download_path));
         }
+        else if (strcmp(key, "tv_download_path2") == 0) {
+            expand_path(value, server_config.tv_download_path2, sizeof(server_config.tv_download_path2));
+        }
+        else if (strcmp(key, "movie_download_path2") == 0) {
+            expand_path(value, server_config.movie_download_path2, sizeof(server_config.movie_download_path2));
+        }
         else if (strcmp(key, "auth_user") == 0) {
             strncpy(server_config.auth_user, value, sizeof(server_config.auth_user) - 1);
         }
@@ -178,6 +186,8 @@ int config_save(const char *path) {
     fprintf(f, "cache_dir = %s\n", server_config.cache_dir);
     fprintf(f, "tv_download_path = %s\n", server_config.tv_download_path);
     fprintf(f, "movie_download_path = %s\n", server_config.movie_download_path);
+    fprintf(f, "tv_download_path2 = %s\n", server_config.tv_download_path2);
+    fprintf(f, "movie_download_path2 = %s\n", server_config.movie_download_path2);
 
     fprintf(f, "\n# Media library paths to watch and scrape\n");
     for (int i = 0; i < server_config.media_path_count; i++) {

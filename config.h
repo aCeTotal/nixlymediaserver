@@ -33,9 +33,12 @@ typedef struct {
     /* Cache directory for thumbnails */
     char cache_dir[MAX_PATH_LEN];
 
-    /* Download destinations for wget downloader */
+    /* Download destinations for wget downloader. Primary + secondary disk;
+     * per download the disk with the most free space is used. */
     char tv_download_path[MAX_PATH_LEN];
     char movie_download_path[MAX_PATH_LEN];
+    char tv_download_path2[MAX_PATH_LEN];
+    char movie_download_path2[MAX_PATH_LEN];
 
     /* HTTP Basic Auth credentials (applied to all HTTP routes). */
     char auth_user[64];
