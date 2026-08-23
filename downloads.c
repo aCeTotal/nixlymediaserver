@@ -10,7 +10,11 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
+#include <unistd.h>
 #include <curl/curl.h>
+
+/* Give up after this many failed transfer attempts (resume between each). */
+#define DOWNLOAD_MAX_RETRIES 5
 
 #include "downloads.h"
 #include "config.h"
@@ -92,24 +96,28 @@ static int progress_cb(void *userdata, curl_off_t dltotal, curl_off_t dlnow,
     DownloadSlot *slot = (DownloadSlot *)userdata;
     double now = mono_now();
     pthread_mutex_lock(&slots_lock);
-    slot->total_bytes = (int64_t)dltotal;
-    slot->downloaded_bytes = (int64_t)dlnow;
+    /* dltotal/dlnow only cover the current attempt — add bytes already on
+     * disk from previous attempts (resume). */
+    int64_t done = slot->resume_offset + (int64_t)dlnow;
+    if (dltotal > 0)
+        slot->total_bytes = slot->resume_offset + (int64_t)dltotal;
+    slot->downloaded_bytes = done;
 
     /* Sample at most ~2× per second to keep EMA noise low. */
     if (slot->last_sample_time == 0.0) {
         slot->last_sample_time = now;
-        slot->last_sample_bytes = (int64_t)dlnow;
+        slot->last_sample_bytes = done;
     } else {
         double dt = now - slot->last_sample_time;
         if (dt >= 0.5) {
-            int64_t db = (int64_t)dlnow - slot->last_sample_bytes;
+            int64_t db = done - slot->last_sample_bytes;
             if (db < 0) db = 0;
             int64_t inst = (int64_t)((double)db / dt);
             /* EMA: smooth out brief stalls/spikes. */
             if (slot->speed_bps <= 0) slot->speed_bps = inst;
             else slot->speed_bps = (int64_t)(0.3 * (double)inst + 0.7 * (double)slot->speed_bps);
             slot->last_sample_time = now;
-            slot->last_sample_bytes = (int64_t)dlnow;
+            slot->last_sample_bytes = done;
         }
     }
     pthread_mutex_unlock(&slots_lock);
@@ -141,40 +149,80 @@ static void *download_thread(void *arg) {
     char tmp_path[sizeof(slot->dest_path) + 16];
     snprintf(tmp_path, sizeof(tmp_path), "%s.nixlypart", slot->dest_path);
 
-    FILE *fp = fopen(tmp_path, "wb");
-    if (!fp) {
-        pthread_mutex_lock(&slots_lock);
-        slot->state = DL_STATE_FAILED;
-        snprintf(slot->error, sizeof(slot->error), "cannot open temp file");
-        pthread_mutex_unlock(&slots_lock);
-        return NULL;
-    }
-
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        fclose(fp);
-        pthread_mutex_lock(&slots_lock);
-        slot->state = DL_STATE_FAILED;
-        snprintf(slot->error, sizeof(slot->error), "curl init failed");
-        pthread_mutex_unlock(&slots_lock);
-        return NULL;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, slot->url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_cb);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, slot);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "nixly-server/1.0");
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-
     time_t t0 = time(NULL);
-    CURLcode rc = curl_easy_perform(curl);
-    time_t t1 = time(NULL);
+    CURLcode rc = CURLE_OK;
+    int attempt = 0;
 
-    fclose(fp);
+    for (;;) {
+        /* Resume from whatever a previous attempt left on disk. */
+        int64_t offset = 0;
+        struct stat st;
+        if (stat(tmp_path, &st) == 0) offset = st.st_size;
+
+        pthread_mutex_lock(&slots_lock);
+        slot->resume_offset = offset;
+        slot->downloaded_bytes = offset;
+        slot->last_sample_time = 0.0;
+        slot->last_sample_bytes = 0;
+        slot->speed_bps = 0;
+        pthread_mutex_unlock(&slots_lock);
+
+        FILE *fp = fopen(tmp_path, offset > 0 ? "ab" : "wb");
+        if (!fp) {
+            pthread_mutex_lock(&slots_lock);
+            slot->state = DL_STATE_FAILED;
+            snprintf(slot->error, sizeof(slot->error), "cannot open temp file");
+            pthread_mutex_unlock(&slots_lock);
+            return NULL;
+        }
+
+        CURL *curl = curl_easy_init();
+        if (!curl) {
+            fclose(fp);
+            pthread_mutex_lock(&slots_lock);
+            slot->state = DL_STATE_FAILED;
+            snprintf(slot->error, sizeof(slot->error), "curl init failed");
+            pthread_mutex_unlock(&slots_lock);
+            return NULL;
+        }
+
+        curl_easy_setopt(curl, CURLOPT_URL, slot->url);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, slot);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "nixly-server/1.0");
+        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+        /* Abort transfers stuck under 1 KB/s for 60s — otherwise a dead
+         * connection hangs forever and the slot stays "active" doing nothing. */
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+        if (offset > 0)
+            curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)offset);
+
+        rc = curl_easy_perform(curl);
+        fclose(fp);
+        curl_easy_cleanup(curl);
+
+        if (rc == CURLE_OK) break;
+
+        error_log("download", "%s — %s (attempt %d/%d)", slot->filename,
+                  curl_easy_strerror(rc), attempt + 1, DOWNLOAD_MAX_RETRIES);
+
+        /* Server can't do byte ranges — partial data unusable, start over. */
+        if (rc == CURLE_RANGE_ERROR) remove(tmp_path);
+
+        if (++attempt >= DOWNLOAD_MAX_RETRIES) break;
+
+        int delay = 5 << attempt;
+        if (delay > 60) delay = 60;
+        sleep(delay);
+    }
+
+    time_t t1 = time(NULL);
 
     pthread_mutex_lock(&slots_lock);
     if (rc == CURLE_OK) {
@@ -192,12 +240,9 @@ static void *download_thread(void *arg) {
     } else {
         slot->state = DL_STATE_FAILED;
         snprintf(slot->error, sizeof(slot->error), "%s", curl_easy_strerror(rc));
-        error_log("download", "%s — %s", slot->filename, curl_easy_strerror(rc));
-        remove(tmp_path);
+        /* Keep the .nixlypart — re-adding the same URL resumes from it. */
     }
     pthread_mutex_unlock(&slots_lock);
-
-    curl_easy_cleanup(curl);
     return NULL;
 }
 
